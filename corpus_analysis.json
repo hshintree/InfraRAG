@@ -1,0 +1,114 @@
+{
+  "corpus_stats": {
+    "total_documents": 6,
+    "total_sections": 202,
+    "total_definitions": 0,
+    "industries": {
+      "Power": 3,
+      "LNG": 2,
+      "Infrastructure": 1
+    },
+    "jurisdictions": {
+      "US-CO": 1,
+      "US": 4,
+      "US-NY": 1
+    },
+    "clause_types": {
+      "Purchase and Sale": 11,
+      "Other": 153,
+      "Covenants": 5,
+      "Price": 4,
+      "Miscellaneous": 5,
+      "Termination": 15,
+      "Notices": 4,
+      "Governing Law": 4,
+      "Dispute Resolution": 1
+    },
+    "document_types": {
+      "Wholesale Power Contract": 3,
+      "Purchase Agreement": 3
+    }
+  },
+  "chunk_analysis": {
+    "total_chunks": 25284,
+    "chunk_types": {
+      "clause": 25284
+    },
+    "top_tags": {
+      "termination": 25263,
+      "assignment": 25197,
+      "governing_law": 25001,
+      "indemnification": 24994,
+      "representations_warranties": 24994,
+      "transmission": 24949,
+      "dispute_resolution": 23678,
+      "arbitration": 23318,
+      "material_adverse_effect": 21707,
+      "liquidated_damages": 17645,
+      "point_of_delivery": 16044,
+      "curtailment": 10298,
+      "delivery": 1287,
+      "purchase_price_adjustment": 909,
+      "pricing": 297,
+      "crod": 268,
+      "force_majeure": 136,
+      "patronage": 118
+    }
+  },
+  "documents": [
+    {
+      "id": "129435_sanitized",
+      "title": "WHOLESALE POWER CONTRACT FOR THE WESTERN INTERCONNECTION",
+      "industry": "Power",
+      "jurisdiction": "US-CO",
+      "parties": 14,
+      "sections": 21,
+      "definitions": 0
+    },
+    {
+      "id": "129435",
+      "title": "Unknown Document",
+      "industry": "Power",
+      "jurisdiction": "US",
+      "parties": 1,
+      "sections": 0,
+      "definitions": 0
+    },
+    {
+      "id": "153885_sanitized",
+      "title": "",
+      "industry": "LNG",
+      "jurisdiction": "US",
+      "parties": 56,
+      "sections": 25,
+      "definitions": 0
+    },
+    {
+      "id": "153885",
+      "title": "Contribution, Purchase And Sale Agreement",
+      "industry": "LNG",
+      "jurisdiction": "US",
+      "parties": 5,
+      "sections": 6,
+      "definitions": 0
+    },
+    {
+      "id": "39638_sanitized",
+      "title": "CERTAIN IDENTIFIED INFORMATION HAS BEEN EXCLUDED FROM THIS EXHIBIT BECAUSE IT IS NOT MATERIAL AND WOULD LIKELY CAUSE COMPETITIVE HARM TO THE REGISTRANT IF PUBLICLY DISCLOSED. [***] INDICATES THAT INFORMATION HAS BEEN REDACTED.",
+      "industry": "Power",
+      "jurisdiction": "US",
+      "parties": 68,
+      "sections": 138,
+      "definitions": 0
+    },
+    {
+      "id": "39638",
+      "title": "Lng Sale And Purchase Agreement",
+      "industry": "Infrastructure",
+      "jurisdiction": "US-NY",
+      "parties": 2,
+      "sections": 12,
+      "definitions": 0
+    }
+  ]
+}
