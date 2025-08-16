@@ -233,6 +233,29 @@ class DocumentIngestionPipeline:
                 stats["clause_types"][clause_type] = stats["clause_types"].get(clause_type, 0) + 1
         
         return stats
+    
+    def save_chunks_to_database(self, chunks: List[ProcessedChunk]):
+        """Save chunks to database with idempotency checks"""
+        from database_storage import DataStorage
+        
+        storage = DataStorage()
+        
+        chunk_data = []
+        for chunk in chunks:
+            chunk_dict = {
+                'document_id': chunk.metadata.document_id,
+                'chunk_index': chunk.metadata.chunk_index,
+                'chunk_id': chunk.metadata.chunk_id,
+                'section_id': chunk.metadata.section_id,
+                'chunk_type': chunk.metadata.chunk_type,
+                'content': chunk.content,
+                'tags': chunk.metadata.tags,
+                'source_citation': chunk.metadata.source_citation,
+                'metadata': {}
+            }
+            chunk_data.append(chunk_dict)
+        
+        storage.save_chunks_to_database(chunk_data)
 
 
 def main():

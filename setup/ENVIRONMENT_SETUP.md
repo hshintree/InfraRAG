@@ -67,22 +67,41 @@ print('✅ All key packages imported successfully!')
 "
 ```
 
-### 6. Set Up Supporting Services (Optional)
+### 6. Set Up Supporting Services (Required)
 
-Start the vector database and search services using Docker:
+Start the database and search services using Docker:
 
 ```bash
-# Start Qdrant (vector database) and OpenSearch (BM25 search)
+# Start all services (PostgreSQL, Qdrant, OpenSearch)
 docker-compose -f docker-compose.rag.yml up -d
 
 # Verify services are running
-docker ps
+curl http://localhost:6333/collections  # Qdrant
+curl http://localhost:9200/_cluster/health  # OpenSearch
+docker logs postgres-infrarag  # PostgreSQL logs
 ```
 
 This will start:
+- **PostgreSQL** on port 5433 (main database with pgvector)
+- **pgAdmin** on port 5050 (database management UI)
 - **Qdrant** on port 6333 (vector database)
 - **OpenSearch** on port 9200 (BM25 search engine)
 - **OpenSearch Dashboards** on port 5601 (web UI)
+
+### 7. Set Environment Variables
+
+Set the required environment variables for database connection:
+
+```bash
+export DB_HOST=localhost
+export DB_PORT=5433
+export DB_NAME=infra_rag
+export DB_USER=postgres
+export DB_PASSWORD=changeme_local_pw
+export OPENSEARCH_URL=http://localhost:9200
+export OPENSEARCH_INDEX=agreements
+export EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
+```
 
 ### 7. Environment Activation for Future Sessions
 

@@ -34,6 +34,38 @@ services:
     ports: ["5601:5601"]
     restart: unless-stopped
 
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: postgres-infrarag
+    environment:
+      POSTGRES_DB: infra_rag
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: changeme_local_pw
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin-infrarag
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: ChangeMe123!
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
 volumes:
   qdrant_data:
   os_data:
+  postgres_data:
