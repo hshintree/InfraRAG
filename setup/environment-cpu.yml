@@ -65,3 +65,7 @@ dependencies:
       - ruff>=0.1
       - mypy>=1.5
       - types-requests>=2.31
+      # Database drivers
+      - psycopg[binary]>=3.2
+      # Remote execution
+      - modal-client>=0.64

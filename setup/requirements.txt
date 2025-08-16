@@ -68,3 +68,6 @@ types-requests>=2.32
 
 # Database drivers
 psycopg[binary]>=3.2
+
+# Remote execution
+modal-client>=0.64
