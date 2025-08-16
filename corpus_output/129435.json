@@ -1,0 +1,27 @@
+{
+  "metadata": {
+    "document_id": "129435",
+    "title": "Unknown Document",
+    "document_type": "Purchase Agreement",
+    "jurisdiction": "US",
+    "governing_law": null,
+    "industry": "Power",
+    "effective_date": "1975-01-16 00:00:00",
+    "execution_date": null,
+    "termination_date": null,
+    "parties": [
+      {
+        "name": "Basin Electric Power Cooperative",
+        "role": "Seller",
+        "jurisdiction": null,
+        "address": null,
+        "entity_type": null
+      }
+    ],
+    "source_file": "129435.pdf",
+    "source_format": "PDF",
+    "processing_date": "2025-08-15 22:57:08.957124"
+  },
+  "sections": [],
+  "definitions": []
+}

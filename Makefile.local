@@ -1,0 +1,15 @@
+COMPOSE=docker compose -f docker-compose.local.yml --env-file .env
+
+.PHONY: up down ps logs
+
+up:
+	$(COMPOSE) up -d
+
+ps:
+	$(COMPOSE) ps
+
+logs:
+	$(COMPOSE) logs -f | cat
+
+down:
+	$(COMPOSE) down -v 

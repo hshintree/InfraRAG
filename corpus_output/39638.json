@@ -1,0 +1,158 @@
+{
+  "metadata": {
+    "document_id": "39638",
+    "title": "Lng Sale And Purchase Agreement",
+    "document_type": "Purchase Agreement",
+    "jurisdiction": "US-NY",
+    "governing_law": "US-NY",
+    "industry": "Infrastructure",
+    "effective_date": "2019-07-10 00:00:00",
+    "execution_date": "2017-11-10 00:00:00",
+    "termination_date": null,
+    "parties": [
+      {
+        "name": "TELLURIAN TRADING UK LTD.",
+        "role": "Seller",
+        "jurisdiction": null,
+        "address": null,
+        "entity_type": null
+      },
+      {
+        "name": "Driftwood LNG LLC",
+        "role": "Seller",
+        "jurisdiction": null,
+        "address": null,
+        "entity_type": "Limited Liability Company"
+      }
+    ],
+    "source_file": "39638.pdf",
+    "source_format": "PDF",
+    "processing_date": "2025-08-15 22:57:14.689249"
+  },
+  "sections": [
+    {
+      "id": "ACQ",
+      "title": "Subject to Sections 5",
+      "text": "",
+      "clause_type": "Other",
+      "tags": [],
+      "definitions": [],
+      "parent_section": null,
+      "page_number": 17
+    },
+    {
+      "id": "84.0",
+      "title": "MOL%",
+      "text": "",
+      "clause_type": "Other",
+      "tags": [],
+      "definitions": [],
+      "parent_section": null,
+      "page_number": 39
+    },
+    {
+      "id": "1.5",
+      "title": "MOL%",
+      "text": "",
+      "clause_type": "Other",
+      "tags": [],
+      "definitions": [],
+      "parent_section": null,
+      "page_number": 40
+    },
+    {
+      "id": "3.5",
+      "title": "MOL%",
+      "text": "",
+      "clause_type": "Other",
+      "tags": [],
+      "definitions": [],
+      "parent_section": null,
+      "page_number": 40
+    },
+    {
+      "id": "13.10",
+      "title": "Verification of Accuracy and Correction for Error",
+      "text": "",
+      "clause_type": "Other",
+      "tags": [],
+      "definitions": [],
+      "parent_section": null,
+      "page_number": 42
+    },
+    {
+      "id": "13.11",
+      "title": "Costs and Expenses",
+      "text": "",
+      "clause_type": "Other",
+      "tags": [],
+      "definitions": [],
+      "parent_section": null,
+      "page_number": 42
+    },
+    {
+      "id": "12.1",
+      "title": "Density Calculation Formula",
+      "text": "",
+      "clause_type": "Other",
+      "tags": [],
+      "definitions": [],
+      "parent_section": null,
+      "page_number": 68
+    },
+    {
+      "id": "12.2",
+      "title": "Calculation of Volume Delivered",
+      "text": "",
+      "clause_type": "Other",
+      "tags": [],
+      "definitions": [],
+      "parent_section": null,
+      "page_number": 69
+    },
+    {
+      "id": "12.3",
+      "title": "Calculation of Gross Heating Value (Mass Based)",
+      "text": "",
+      "clause_type": "Other",
+      "tags": [],
+      "definitions": [],
+      "parent_section": null,
+      "page_number": 69
+    },
+    {
+      "id": "12.4",
+      "title": "MMBtu Calculation of the Quantity of LNG Loaded",
+      "text": "",
+      "clause_type": "Other",
+      "tags": [],
+      "definitions": [],
+      "parent_section": null,
+      "page_number": 69
+    },
+    {
+      "id": "12.5",
+      "title": "Calculation of Gross Heating Value (Volume Based)",
+      "text": "",
+      "clause_type": "Other",
+      "tags": [],
+      "definitions": [],
+      "parent_section": null,
+      "page_number": 70
+    },
+    {
+      "id": "12.6",
+      "title": "Data",
+      "text": "12.6    Data\n(a)    Values of Hi and Mi\nComponent\nHi (in MJ/kg)\nMi (in kg/kmol)\nMethane\n55.575\n16.0425\nEthane\n51.951\n30.0690\nPropane\n50.369\n44.0956\nIso-Butane\n49.388\n58.1222\nN-Butane\n49.546\n58.1222\nIso-Pentane\n48.950\n72.1488\nN-Pentane\n49.045\n72.1488\nN-Hexane\n48.715\n86.1754\nNitrogen\n0\n28.0134\nCarbon Dioxide\n0\n44.0095\nOxygen\n0\n31.9988\nSource: GPA Publication 2145 Sl-2009: “Table of Physical Properties for Hydrocarbons and Other Compounds of Interest to the Natural\nGas Industry”.\n(b)    Values of Vi (cubic meter/kmol)\nA-13\nTemperature\n-150°C\n-154°C\n-158°C\n-160°C\n-162°C\n-166°C\n-170°C\nMethane\n0.039579\n0.038983\n0.038419\n0.038148\n0.037884\n0.037375\n0.036890\nEthane\n0.048805\n0.048455\n0.048111\n0.047942\n0.047774\n0.047442\n0.047116\nPropane\n0.063417\n0.063045\n0.062678\n0.062497\n0.062316\n0.061957\n0.061602\nIso-Butane\n0.079374\n0.078962\n0.078554\n0.078352\n0.078151\n0.077751\n0.077356\nN-Butane\n0.077847\n0.077456\n0.077068\n0.076876\n0.076684\n0.076303\n0.075926\nIso-Pentane\n0.092817\n0.092377\n0.091939\n0.091721\n0.091504\n0.091071\n0.090641\nN-Pentane\n0.092643\n0.092217\n0.091794\n0.091583\n0.091373\n0.090953\n0.090535\nN-Hexane\n0.106020\n0.105570\n0.105122\n0.104899\n0.104677\n0.104236\n0.103800\nNitrogen\n0.055877\n0.051921\n0.048488\n0.046995\n0.045702\n0.043543\n0.041779\nCarbon Dioxide\n0.027950\n0.027650\n0.027300\n0.027200\n0.027000\n0.026700\n0.026400\nOxygen\n0.03367\n0.03275\n0.03191\n0.03151\n0.03115\n0.03045\n0.02980\nSource: National Bureau of Standards Interagency Report 77-867, Institute of Petroleum IP251/76 for Oxygen.\nNote:    For intermediate values of temperature and molecular mass a linear interpolation shall be applied\n(c)    Values of Volume Correction Factor, K1 (cubic meter/kmol)\nA-14\nMolecular\nMass of\nMixture\n-150°C\n-154°C\n-158°C\n-160°C\n-162°C\n-166°C\n-170°C\n16.0\n-0.000012\n-0.000010\n-0.000009\n-0.000009\n-0.000008\n-0.000007\n-0.000007\n16.5\n0.000135\n0.000118\n0.000106\n0.000100\n0.000094\n0.000086\n0.000078\n17.0\n0.000282\n0.000245\n0.000221\n0.000209\n0.000197\n0.000179\n0.000163\n17.2\n0.000337\n0.000293\n0.000261\n0.000248\n0.000235\n0.000214\n0.000195\n17.4\n0.000392\n0.000342\n0.000301\n0.000287\n0.000274\n0.000250\n0.000228\n17.6\n0.000447\n0.000390\n0.000342\n0.000327\n0.000312\n0.000286\n0.000260\n17.8\n0.000502\n0.000438\n0.000382\n0.000366\n0.000351\n0.000321\n0.000293\n18.0\n0.000557\n0.000486\n0.000422\n0.000405\n0.000389\n0.000357\n0.000325\n18.2\n0.000597\n0.000526\n0.000460\n0.000441\n0.000423\n0.000385\n0.000349\n18.4\n0.000637\n0.000566\n0.000499\n0.000477\n0.000456\n0.000412\n0.000373\n18.6\n0.000677\n0.000605\n0.000537\n0.000513\n0.000489\n0.000440\n0.000397\n18.8\n0.000717\n0.000645\n0.000575\n0.000548\n0.000523\n0.000467\n0.000421\n19.0\n0.000757\n0.000685\n0.000613\n0.000584\n0.000556\n0.000494\n0.000445\n19.2\n0.000800\n0.000724\n0.000649\n0.000619\n0.000589\n0.000526\n0.000474\n19.4\n0.000844\n0.000763\n0.000685\n0.000653\n0.000622\n0.000558\n0.000503\n19.6\n0.000888\n0.000803\n0.000721\n0.000688\n0.000655\n0.000590\n0.000532\n19.8\n0.000932\n0.000842\n0.000757\n0.000722\n0.000688\n0.000622\n0.000561\n20.0\n0.000976\n0.000881\n0.000793\n0.000757\n0.000721\n0.000654\n0.000590\n25.0\n0.001782\n0.001619\n0.001475\n0.001407\n0.001339\n0.001220\n0.001116\n30.0\n0.002238\n0.002043\n0.001867\n0.001790\n0.001714\n0.001567\n0.001435\nSource: National Bureau of Standards Interagency Report 77-867.\nNote 1:    Molecular mass of mixture equals ∑ (Xi x Mi).\nNote 2:    For intermediate values of temperature and molecular mass a linear interpolation shall be applied.\n(d)    Values of Volume Correction Factor, K2 (cubic meter/kmol)\nA-15\nMolecular\nMass of\nMixture\n-150°C\n-154°C\n-158°C\n-160°C\n-162°C\n-166°C\n-170°C\n16.0\n-0.000039\n-0.000031\n-0.000024\n-0.000021\n-0.000017\n-0.000012\n-0.000009\n16.5\n0.000315\n0.000269\n0.000196\n0.000178\n0.000162\n0.000131\n0.000101\n17.0\n0.000669\n0.000568\n0.000416\n0.000377\n0.000341\n0.000274\n0.000210\n17.2\n0.000745\n0.000630\n0.000478\n0.000436\n0.000397\n0.000318\n0.000246\n17.4\n0.000821\n0.000692\n0.000540\n0.000495\n0.000452\n0.000362\n0.000282\n17.6\n0.000897\n0.000754\n0.000602\n0.000554\n0.000508\n0.000406\n0.000318\n17.8\n0.000973\n0.000816\n0.000664\n0.000613\n0.000564\n0.000449\n0.000354\n18.0\n0.001049\n0.000878\n0.000726\n0.000672\n0.000620\n0.000493\n0.000390\n18.2\n0.001116\n0.000939\n0.000772\n0.000714\n0.000658\n0.000530\n0.000425\n18.4\n0.001184\n0.001000\n0.000819\n0.000756\n0.000696\n0.000567\n0.000460\n18.6\n0.001252\n0.001061\n0.000865\n0.000799\n0.000735\n0.000605\n0.000496\n18.8\n0.001320\n0.001121\n0.000912\n0.000841\n0.000773\n0.000642\n0.000531\n19.0\n0.001388\n0.001182\n0.000958\n0.000883\n0.000811\n0.000679\n0.000566\n19.2\n0.001434\n0.001222\n0.000998\n0.000920\n0.000844\n0.000708\n0.000594\n19.4\n0.001480\n0.001262\n0.001038\n0.000956\n0.000876\n0.000737\n0.000623\n19.6\n0.001526\n0.001302\n0.001078\n0.000992\n0.000908\n0.000765\n0.000652\n19.8\n0.001573\n0.001342\n0.001118\n0.001029\n0.000941\n0.000794\n0.000681\n20.0\n0.001619\n0.001382\n0.001158\n0.001065\n0.000973\n0.000823\n0.000709\n25.0\n0.002734\n0.002374\n0.002014\n0.001893\n0.001777\n0.001562\n0.001383\n30.0\n0.003723\n0.003230\n0.002806\n0.002631\n0.002459\n0.002172\n0.001934\nSource: National Bureau of Standards Interagency Report 77-867.\nNote 1:    Molecular mass of mixture equals ∑ (Xi x Mi).\nNote 2:    For intermediate values of temperature and molecular mass a linear interpolation shall be applied.\nA-16",
+      "clause_type": "Other",
+      "tags": [],
+      "definitions": [
+        "GPA",
+        "MJ"
+      ],
+      "parent_section": null,
+      "page_number": 70
+    }
+  ],
+  "definitions": []
+}

@@ -65,3 +65,6 @@ black>=24.4
 ruff>=0.5
 mypy>=1.10
 types-requests>=2.32
+
+# Database drivers
+psycopg[binary]>=3.2
