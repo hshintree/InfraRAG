@@ -7,10 +7,10 @@ from database_storage import DataStorage
 
 def main():
     os.environ.setdefault('DB_HOST', 'localhost')
-    os.environ.setdefault('DB_PORT', '5433')
-    os.environ.setdefault('DB_NAME', 'infra_rag')
-    os.environ.setdefault('DB_USER', 'postgres')
-    os.environ.setdefault('DB_PASSWORD', 'changeme_local_pw')
+    os.environ.setdefault('DB_PORT', '5434')
+    os.environ.setdefault('DB_NAME', 'infrarag_db')
+    os.environ.setdefault('DB_USER', 'infrarag_user')
+    os.environ.setdefault('DB_PASSWORD', 'infrarag_secure_pw_2024')
     
     try:
         storage = DataStorage()

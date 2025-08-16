@@ -76,17 +76,17 @@ Start the database and search services using Docker:
 docker-compose -f docker-compose.rag.yml up -d
 
 # Verify services are running
-curl http://localhost:6333/collections  # Qdrant
-curl http://localhost:9200/_cluster/health  # OpenSearch
+curl http://localhost:6334/collections  # Qdrant
+curl http://localhost:9201/_cluster/health  # OpenSearch
 docker logs postgres-infrarag  # PostgreSQL logs
 ```
 
 This will start:
-- **PostgreSQL** on port 5433 (main database with pgvector)
-- **pgAdmin** on port 5050 (database management UI)
-- **Qdrant** on port 6333 (vector database)
-- **OpenSearch** on port 9200 (BM25 search engine)
-- **OpenSearch Dashboards** on port 5601 (web UI)
+- **PostgreSQL** on port 5434 (main database with pgvector)
+- **pgAdmin** on port 5051 (database management UI)
+- **Qdrant** on port 6334 (vector database)
+- **OpenSearch** on port 9201 (BM25 search engine)
+- **OpenSearch Dashboards** on port 5602 (web UI)
 
 ### 7. Set Environment Variables
 
@@ -94,11 +94,11 @@ Set the required environment variables for database connection:
 
 ```bash
 export DB_HOST=localhost
-export DB_PORT=5433
-export DB_NAME=infra_rag
-export DB_USER=postgres
-export DB_PASSWORD=changeme_local_pw
-export OPENSEARCH_URL=http://localhost:9200
+export DB_PORT=5434
+export DB_NAME=infrarag_db
+export DB_USER=infrarag_user
+export DB_PASSWORD=infrarag_secure_pw_2024
+export OPENSEARCH_URL=http://localhost:9201
 export OPENSEARCH_INDEX=agreements
 export EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
 ```

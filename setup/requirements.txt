@@ -16,15 +16,15 @@ opensearch-py>=2.5
 rank-bm25>=0.2
 
 # NLP / embeddings / rerankers
-openai>=1.40
-tiktoken>=0.7
-sentence-transformers>=2.7
-transformers>=4.43
-accelerate>=0.33
-torch>=2.3
-spacy>=3.7
-spacy-lookups-data>=1.0
-rapidfuzz>=3.9
+openai>=1.40.0
+tiktoken>=0.7.0
+sentence-transformers>=2.7.0
+transformers>=4.43.0
+accelerate>=0.33.0
+torch>=2.3.0,<2.5.0
+spacy>=3.7.0
+spacy-lookups-data>=1.0.0
+rapidfuzz>=3.9.0
 
 # Parsing & PDF/XML
 pymupdf>=1.24
@@ -67,7 +67,10 @@ mypy>=1.10
 types-requests>=2.32
 
 # Database dependencies
-sqlalchemy>=2.0
-psycopg2-binary>=2.9
-pgvector>=0.2
-alembic>=1.13
+sqlalchemy>=2.0.0,<3.0.0
+psycopg2-binary>=2.9.0
+pgvector>=0.2.4
+alembic>=1.13.0
+
+# Additional database utilities
+asyncpg>=0.29.0

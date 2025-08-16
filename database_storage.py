@@ -50,10 +50,10 @@ class DataStorage:
     
     def __init__(self):
         self.db_host = os.getenv("DB_HOST", "localhost")
-        self.db_port = os.getenv("DB_PORT", "5433")
-        self.db_name = os.getenv("DB_NAME", "infra_rag")
+        self.db_port = os.getenv("DB_PORT", "5434")
+        self.db_name = os.getenv("DB_NAME", "infrarag_db")
         self.db_user = os.getenv("DB_USER", "postgres")
-        self.db_password = os.getenv("DB_PASSWORD", "changeme_local_pw")
+        self.db_password = os.getenv("DB_PASSWORD", "infrarag_secure_pw_2024")
         
         print(f"Connecting to database: {self.db_host}:{self.db_port}/{self.db_name}")
         
