@@ -210,20 +210,23 @@ def _ensure_vector_index() -> None:
 
 
 def _ensure_fts() -> None:
-	"""Weighted tsvector maintained via trigger (title^A + content^B) + unaccent + GIN index."""
+	"""Weighted tsvector maintained via trigger (title^A + content^B) + unaccent + GIN index.
+	Also maintain a parallel simple-dict FTS (keeps numbers) for numeric phrases.
+	"""
 	global _FTS_READY
 	if _FTS_READY:
 		return
 	with _connect() as conn, conn.cursor() as cur:
 		cur.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
-		# Ensure fts column exists
+		# Ensure columns exist
 		cur.execute(
 			"""
 			ALTER TABLE IF EXISTS clauses
-			  ADD COLUMN IF NOT EXISTS fts tsvector
+			  ADD COLUMN IF NOT EXISTS fts tsvector,
+			  ADD COLUMN IF NOT EXISTS fts_simple tsvector
 			"""
 		)
-		# Create or replace trigger function to maintain fts
+		# Trigger function maintains both fts columns
 		cur.execute(
 			"""
 			CREATE OR REPLACE FUNCTION clauses_fts_update() RETURNS trigger AS $$
@@ -231,6 +234,7 @@ def _ensure_fts() -> None:
 			  NEW.fts :=
 			    setweight(to_tsvector('english', unaccent(coalesce(NEW.title,''))), 'A') ||
 			    setweight(to_tsvector('english', unaccent(coalesce(NEW.content,''))), 'B');
+			  NEW.fts_simple := to_tsvector('simple', unaccent(coalesce(NEW.title,'') || ' ' || coalesce(NEW.content,'')));
 			  RETURN NEW;
 			END
 			$$ LANGUAGE plpgsql;
@@ -254,16 +258,16 @@ def _ensure_fts() -> None:
 		# Backfill any NULL fts values once
 		cur.execute(
 			"""
-			UPDATE clauses SET fts =
-			  setweight(to_tsvector('english', unaccent(coalesce(title,''))), 'A') ||
-			  setweight(to_tsvector('english', unaccent(coalesce(content,''))), 'B')
-			WHERE fts IS NULL
+			UPDATE clauses SET 
+			  fts = setweight(to_tsvector('english', unaccent(coalesce(title,''))), 'A') ||
+			        setweight(to_tsvector('english', unaccent(coalesce(content,''))), 'B'),
+			  fts_simple = to_tsvector('simple', unaccent(coalesce(title,'') || ' ' || coalesce(content,'')))
+			WHERE fts IS NULL OR fts_simple IS NULL
 			"""
 		)
-		# Index on fts
-		cur.execute(
-			"CREATE INDEX IF NOT EXISTS clauses_fts_idx ON clauses USING gin(fts)"
-		)
+		# Indexes
+		cur.execute("CREATE INDEX IF NOT EXISTS clauses_fts_idx ON clauses USING gin(fts)")
+		cur.execute("CREATE INDEX IF NOT EXISTS clauses_fts_simple_idx ON clauses USING gin(fts_simple)")
 		conn.commit()
 		_FTS_READY = True
 
@@ -507,8 +511,13 @@ def search_hybrid(
 	probes: Optional[int] = None,
 	rrf_k: Optional[int] = None,
 	expand_sparse: bool = True,
+	sparse_weight: float = 0.6,
+	must_tokens: Optional[List[str]] = None,
+	heading_like: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-	"""Cosine ANN + weighted FTS, fused by RRF. Returns rows with rrf score + context."""
+	"""Cosine ANN + weighted FTS, fused by RRF. Returns rows with rrf score + context.
+	Optionally require must_tokens (all must appear via ILIKE) to prefilter candidates.
+	"""
 	_ensure_schema()
 	_ensure_vector_index()
 	_ensure_fts()
@@ -519,6 +528,8 @@ def search_hybrid(
 	q_fts = _expand_for_fts(query) if expand_sparse else query
 	probes = probes or IVFFLAT_PROBES
 	rrf_k = rrf_k or RRF_K
+	must_count = len(must_tokens) if must_tokens else 0
+	patterns = [f"%{t}%" for t in (must_tokens or [])]
 
 	with _connect() as conn, conn.cursor(row_factory=dict_row) as cur:
 		cur.execute(f"SET LOCAL ivfflat.probes = {int(probes)}")
@@ -527,25 +538,50 @@ def search_hybrid(
 			WITH params AS (
 			  SELECT %s::vector AS qvec,
 					 websearch_to_tsquery('english', %s) AS q,
+					 plainto_tsquery('simple', %s) AS q_simple,
 					 %s::int AS pool_n,
-					 %s::int AS k
+					 %s::int AS k,
+					 %s::int AS must_n,
+					 %s::text[] AS must_patterns,
+					 %s::float AS sparse_w,
+					 %s::text AS heading_like
 			),
 			dense AS (
 			  SELECT id,
 					 row_number() OVER (ORDER BY embedding <-> (SELECT qvec FROM params)) AS r_dense
-			  FROM clauses
+			  FROM clauses c
 			  WHERE embedding IS NOT NULL
+			    AND ( (SELECT heading_like FROM params) IS NULL OR c.heading_number LIKE (SELECT heading_like FROM params) )
+			    AND (
+			      (SELECT must_n FROM params)=0 OR (
+			        SELECT bool_and(c.content ILIKE p)
+			        FROM unnest((SELECT must_patterns FROM params)) AS p
+			      )
+			    )
 			  ORDER BY embedding <-> (SELECT qvec FROM params)
 			  LIMIT (SELECT pool_n FROM params)
 			),
 			sparse AS (
 			  SELECT id,
 					 row_number() OVER (
-					   ORDER BY ts_rank_cd(fts, (SELECT q FROM params), 32) DESC
+					   ORDER BY (
+					     ts_rank_cd(fts, (SELECT q FROM params), 32)
+					     + 0.2 * ts_rank_cd(fts_simple, (SELECT q_simple FROM params))
+					   ) DESC
 					 ) AS r_sparse
-			  FROM clauses
+			  FROM clauses c
 			  WHERE fts @@ (SELECT q FROM params)
-			  ORDER BY ts_rank_cd(fts, (SELECT q FROM params), 32) DESC
+			    AND ( (SELECT heading_like FROM params) IS NULL OR c.heading_number LIKE (SELECT heading_like FROM params) )
+			    AND (
+			      (SELECT must_n FROM params)=0 OR (
+			        SELECT bool_and(c.content ILIKE p)
+			        FROM unnest((SELECT must_patterns FROM params)) AS p
+			      )
+			    )
+			  ORDER BY (
+					 ts_rank_cd(fts, (SELECT q FROM params), 32)
+					 + 0.2 * ts_rank_cd(fts_simple, (SELECT q_simple FROM params))
+				) DESC
 			  LIMIT (SELECT pool_n FROM params)
 			),
 			unioned AS (
@@ -559,8 +595,8 @@ def search_hybrid(
 			),
 			fused AS (
 			  SELECT id,
-					 COALESCE(1.0/((SELECT k FROM params) + r_dense), 0.0) +
-					 COALESCE(1.0/((SELECT k FROM params) + r_sparse), 0.0) AS rrf
+					 (SELECT sparse_w FROM params) * COALESCE(1.0/((SELECT k FROM params) + r_sparse), 0.0)
+					 + (1.0 - (SELECT sparse_w FROM params)) * COALESCE(1.0/((SELECT k FROM params) + r_dense), 0.0) AS rrf
 			  FROM agg
 			)
 			SELECT c.id, c.document_id, c.section_id, c.title, c.content, f.rrf
@@ -569,7 +605,7 @@ def search_hybrid(
 			ORDER BY f.rrf DESC
 			LIMIT %s
 			""",
-			(qvec_lit, q_fts, pool_n, rrf_k, top_k),
+			(qvec_lit, q_fts, query, pool_n, rrf_k, must_count, patterns, float(sparse_weight), heading_like, top_k),
 		)
 		rows = cur.fetchall()
 
@@ -759,7 +795,9 @@ def _populate_adjacent_edges(document_id: Optional[str] = None) -> int:
 
 
 def _populate_refers_to_edges(document_id: Optional[str] = None) -> None:
-	"""Scan content for references like 'Section 6.2' or 'Clause 14.1' and link within same document."""
+	"""Scan content for references like 'Section 6.2' or 'Clause 14.1' and link within same document.
+	Requires a legal token (Section/Clause/Article/§); splits simple ranges like 20.1.12-20.1.15.
+	"""
 	_backfill_heading_numbers(document_id)
 	with _connect() as conn, conn.cursor(row_factory=dict_row) as cur:
 		doc_clause_map: Dict[str, Dict[str, int]] = {}
@@ -775,17 +813,37 @@ def _populate_refers_to_edges(document_id: Optional[str] = None) -> None:
 			if not hn:
 				continue
 			doc_clause_map.setdefault(row["document_id"], {})[hn] = row["id"]
-		# Scan contents for refs
+		# Strict legal-reference regex with optional range
+		ref_re = re.compile(
+			r"\b(?:Sections?|Clauses?|Articles?|§)\s*(\d+(?:\.\d+)*(?:\s*(?:–|-|to)\s*\d+(?:\.\d+)*)?)",
+			flags=re.IGNORECASE,
+		)
 		cur.execute(f"SELECT id, document_id, content FROM clauses {where}", tuple(params))
 		rows = cur.fetchall()
-		ref_re = re.compile(r"\b(?:Section|Clause|§|¶)?\s*([0-9]+(?:\.[0-9]+)*)")
 		for r in rows:
 			text = r.get("content") or ""
-			candidates = set(m.group(1) for m in ref_re.finditer(text))
-			if not candidates:
+			matches = [m.group(1) for m in ref_re.finditer(text)]
+			if not matches:
 				continue
 			mapping = doc_clause_map.get(r["document_id"], {})
-			for num in candidates:
+			nums: List[str] = []
+			for m in matches:
+				m = m.replace("–", "-")
+				if "-" in m or " to " in m:
+					parts = re.split(r"\s*(?:-|to)\s*", m)
+					if len(parts) == 2:
+						start, end = parts
+						# expand only if same prefix except last component
+						sp = start.split(".")
+						ep = end.split(".")
+						if len(sp) == len(ep) and sp[:-1] == ep[:-1] and sp[-1].isdigit() and ep[-1].isdigit():
+							for i in range(int(sp[-1]), int(ep[-1]) + 1):
+								nums.append(".".join(sp[:-1] + [str(i)]))
+						else:
+							nums.extend([start, end])
+				else:
+					nums.append(m)
+			for num in dict.fromkeys(nums):
 				dst = mapping.get(num)
 				if dst:
 					cur.execute(

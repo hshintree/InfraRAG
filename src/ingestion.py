@@ -5,10 +5,11 @@ Handles parsing, chunking, normalization, and indexing.
 
 import os
 import json
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Tuple
 from pathlib import Path
 import hashlib
 from datetime import datetime
+import re
 
 from .schema import LegalDocument, ProcessedChunk, ChunkMetadata, LEGAL_TERM_SYNONYMS, INFRA_FINANCE_TERMS
 from .parsers.xml_parser import XMLLegalParser
@@ -87,6 +88,25 @@ class DocumentIngestionPipeline:
         
         return normalized_text
     
+    def _extract_heading_meta(self, section_text: str) -> Optional[Tuple[str, int, Optional[str]]]:
+        """Extract the first hierarchical heading in the section like 11.4 or 20.1.13.
+        Returns (heading_number, level, parent_heading_number) if found.
+        """
+        # Look at the very first line(s) for a heading number pattern
+        lines = [l.strip() for l in section_text.splitlines() if l.strip()]
+        if not lines:
+            return None
+        m = re.match(r"^(\d+(?:\.\d+)+)\b", lines[0])
+        if not m and len(lines) > 1:
+            m = re.match(r"^(\d+(?:\.\d+)+)\b", lines[1])
+        if not m:
+            return None
+        num = m.group(1)
+        parts = num.split('.')
+        level = len(parts)
+        parent = '.'.join(parts[:-1]) if level > 1 else None
+        return num, level, parent
+    
     def chunk_document(self, document: LegalDocument) -> List[ProcessedChunk]:
         """Create chunks from document for retrieval system"""
         chunks = []
@@ -106,6 +126,21 @@ class DocumentIngestionPipeline:
         chunks = []
         text = section.text
         
+        # Prefer Section.id if it already looks like a hierarchical number; else parse from text
+        heading_number = None
+        heading_level = None
+        parent_heading = None
+        if re.match(r"^\d+(?:\.\d+)+$", str(section.id or "").strip()):
+            heading_number = str(section.id).strip()
+            parts = heading_number.split('.')
+            heading_level = len(parts)
+            parent_heading = '.'.join(parts[:-1]) if heading_level > 1 else None
+        else:
+            heading_meta = self._extract_heading_meta(text)
+            heading_number = heading_meta[0] if heading_meta else None
+            heading_level = heading_meta[1] if heading_meta else None
+            parent_heading = heading_meta[2] if heading_meta else None
+        
         if len(text) <= self.max_chunk_size:
             chunk = ProcessedChunk(
                 metadata=ChunkMetadata(
@@ -115,7 +150,10 @@ class DocumentIngestionPipeline:
                     chunk_index=0,
                     chunk_type="clause",
                     tags=section.tags,
-                    source_citation=f"{document.metadata.title}, Section {section.id}"
+                    source_citation=f"{document.metadata.title}, Section {section.id}",
+                    heading_number=heading_number,
+                    heading_level=heading_level,
+                    parent_heading_number=parent_heading,
                 ),
                 content=text
             )
@@ -131,7 +169,10 @@ class DocumentIngestionPipeline:
                         chunk_index=i,
                         chunk_type="clause",
                         tags=section.tags,
-                        source_citation=f"{document.metadata.title}, Section {section.id}"
+                        source_citation=f"{document.metadata.title}, Section {section.id}",
+                        heading_number=heading_number,
+                        heading_level=heading_level,
+                        parent_heading_number=parent_heading,
                     ),
                     content=chunk_text
                 )
@@ -151,7 +192,10 @@ class DocumentIngestionPipeline:
                 chunk_index=0,
                 chunk_type="definition",
                 tags=["definition", definition.term.lower().replace(' ', '_')],
-                source_citation=f"{document.metadata.title}, Definition: {definition.term}"
+                source_citation=f"{document.metadata.title}, Definition: {definition.term}",
+                heading_number=None,
+                heading_level=None,
+                parent_heading_number=None,
             ),
             content=content
         )

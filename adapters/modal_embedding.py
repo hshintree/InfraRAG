@@ -1,5 +1,6 @@
 import modal
 from typing import List
+import os
 
 app = modal.App("infra-embedder")
 
@@ -12,9 +13,20 @@ image = (
 		])
 )
 
+# Tuning knobs
+_DEFAULT_BATCH = int(os.getenv("EMBED_BATCH_SIZE", "128"))
+_PARALLEL_CALLS = int(os.getenv("EMBED_PARALLEL", "4"))
 
-@app.function(image=image, timeout=600)
-def embed_texts_384(texts: list, model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> list:
+
+@app.function(
+	image=image,
+	timeout=600,
+	scaledown_window=300,
+	cpu=4.0,
+	memory=16384,
+	max_containers=8,
+)
+def embed_texts_384(texts: list, model_name: str = "sentence-transformers/all-MiniLM-L6-v2", batch_size: int = _DEFAULT_BATCH) -> list:
 	from transformers import AutoTokenizer, AutoModel
 	import torch
 	import torch.nn.functional as F
@@ -24,7 +36,8 @@ def embed_texts_384(texts: list, model_name: str = "sentence-transformers/all-Mi
 	model.eval()
 
 	embeddings = []
-	batch_size = 128
+	if batch_size <= 0:
+		batch_size = _DEFAULT_BATCH
 	for i in range(0, len(texts), batch_size):
 		batch = texts[i:i+batch_size]
 		with torch.no_grad():
@@ -42,19 +55,25 @@ def embed_texts_384(texts: list, model_name: str = "sentence-transformers/all-Mi
 	return embeddings
 
 
-def embed_texts_remote(texts: List[str], max_batch: int = 1024) -> List[List[float]]:
+def embed_texts_remote(texts: List[str], max_batch: int = 1024, parallel: int = _PARALLEL_CALLS, batch_size: int = _DEFAULT_BATCH) -> List[List[float]]:
 	"""Call the Modal function in chunks and return embeddings.
 
 	Requires Modal credentials configured locally.
 	"""
 	results: List[List[float]] = []
 	with app.run():
+		futures = []
 		for i in range(0, len(texts), max_batch):
 			batch = texts[i:i+max_batch]
-			out = embed_texts_384.remote(batch)
-			if hasattr(out, "get"):
-				vecs = out.get()
-			else:
-				vecs = out
+			f = embed_texts_384.remote(batch, batch_size=batch_size)
+			futures.append(f)
+			if len(futures) >= max(1, parallel):
+				for fut in futures:
+					vecs = fut.get() if hasattr(fut, "get") else fut
+					results.extend(vecs)
+				futures = []
+		# drain remaining
+		for fut in futures:
+			vecs = fut.get() if hasattr(fut, "get") else fut
 			results.extend(vecs)
 	return results 

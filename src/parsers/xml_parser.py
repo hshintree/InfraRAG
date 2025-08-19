@@ -220,6 +220,9 @@ class XMLLegalParser:
         content_parts = []
         
         header_text = ET.tostring(header_elem, encoding='unicode', method='text').strip()
+        toc_no = header_elem.get('toc_number')
+        if toc_no:
+            header_text = f"{toc_no} {header_text}"
         content_parts.append(header_text)
         
         all_paras = root.findall('.//{http://www.tei-c.org/ns/1.0}p')
@@ -229,10 +232,18 @@ class XMLLegalParser:
                 header_index = i
                 break
         
+        def is_header(elem: ET.Element) -> bool:
+            # Symmetric with header detection used in _extract_sections
+            has_xml_id = bool(elem.get('{http://www.w3.org/XML/1998/namespace}id'))
+            has_toc = bool(elem.get('toc_number'))
+            has_base = bool(elem.get('base'))
+            return has_xml_id and (has_toc or has_base)
+        
         if header_index >= 0:
             for i in range(header_index + 1, len(all_paras)):
                 current = all_paras[i]
-                if current.get('{http://www.w3.org/XML/1998/namespace}id') and current.get('base') and current.get('toc_number'):
+                # Stop at the next header paragraph
+                if is_header(current):
                     break
                 
                 para_text = ET.tostring(current, encoding='unicode', method='text').strip()

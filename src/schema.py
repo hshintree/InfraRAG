@@ -111,6 +111,10 @@ class ChunkMetadata(BaseModel):
     chunk_type: str = Field(..., description="Type of chunk (clause, definition, schedule)")
     tags: List[str] = Field(default_factory=list, description="Semantic tags")
     source_citation: str = Field(..., description="Citation reference for the chunk")
+    # Hierarchical clause anchors (optional)
+    heading_number: Optional[str] = Field(None, description="Hierarchical heading number like 11.4 or 20.1.13")
+    heading_level: Optional[int] = Field(None, description="Heading depth level (1,2,3,...) based on dots")
+    parent_heading_number: Optional[str] = Field(None, description="Parent heading number if applicable")
 
 
 class ProcessedChunk(BaseModel):
