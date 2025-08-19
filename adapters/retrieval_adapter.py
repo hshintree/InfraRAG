@@ -316,45 +316,6 @@ def _ensure_uniqueness_guard() -> None:
 		_UNIQ_READY = True
 
 
-def maintenance_compact_and_dedupe() -> Dict[str, Any]:
-	"""Optional: call manually to remove duplicate rows and refresh FTS."""
-	with _connect() as conn, conn.cursor() as cur:
-		# Count dup groups
-		cur.execute(
-			"""
-			SELECT COUNT(*) FROM (
-			  SELECT document_id, section_id, COUNT(*)
-			  FROM clauses
-			  GROUP BY 1,2 HAVING COUNT(*)>1
-			) x
-			"""
-		)
-		dup_groups = cur.fetchone()[0]
-
-		# Delete newer duplicates, keep smallest id per (document_id, section_id, content_hash)
-		cur.execute(
-			"""
-			DELETE FROM clauses t
-			USING (
-			  SELECT id,
-					 row_number() OVER (PARTITION BY document_id, section_id, content_hash ORDER BY id) AS rn
-			  FROM clauses
-			) d
-			WHERE t.id=d.id AND d.rn>1
-			"""
-		)
-		# Refresh FTS column fully
-		cur.execute(
-			"""
-			UPDATE clauses SET content_tsv =
-			  setweight(to_tsvector('english', unaccent(coalesce(title,''))), 'A') ||
-			  setweight(to_tsvector('english', unaccent(coalesce(content,''))), 'B')
-			"""
-		)
-		conn.commit()
-	return {"duplicate_groups_before": dup_groups}
-
-
 # ---------------------------
 # Query helpers
 # ---------------------------
@@ -374,10 +335,12 @@ def _expand_for_fts(query: str) -> str:
 	return f'{query} OR ' + " OR ".join(sorted(set(extras)))
 
 
-def _attach_neighbors_and_defs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-	"""Best-effort context expansion: ±1 neighbors (requires seq), definitions (requires clause_type/defined_terms)."""
+def _attach_neighbors_and_defs(rows: List[Dict[str, Any]], neighbor_window: Optional[int] = None, max_def_match: Optional[int] = None) -> List[Dict[str, Any]]:
+	"""Best-effort context expansion: ±window neighbors (requires seq), definitions (requires clause_type/defined_terms)."""
 	if not rows:
 		return rows
+	window = NEIGHBOR_WINDOW if neighbor_window is None else int(neighbor_window)
+	def_cap = MAX_DEF_MATCH if max_def_match is None else int(max_def_match)
 	with _connect() as conn, conn.cursor(row_factory=dict_row) as cur:
 		have_seq = _column_exists(cur, "clauses", "seq")
 		have_ct = _column_exists(cur, "clauses", "clause_type")
@@ -399,7 +362,7 @@ def _attach_neighbors_and_defs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any
 						WHERE document_id=%s AND seq BETWEEN %s AND %s
 						ORDER BY seq
 						""",
-						(r["document_id"], seq - NEIGHBOR_WINDOW, seq + NEIGHBOR_WINDOW),
+						(r["document_id"], seq - window, seq + window),
 					)
 					r["neighbors"] = [
 						{"section_id": x["section_id"], "title": x["title"], "content": x["content"]}
@@ -413,11 +376,11 @@ def _attach_neighbors_and_defs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any
 				cur.execute("SELECT defined_terms FROM clauses WHERE id=%s", (r["id"],))
 				termrow = cur.fetchone()
 				if termrow and termrow["defined_terms"]:
-					candidate_terms = termrow["defined_terms"][:MAX_DEF_MATCH]
+					candidate_terms = termrow["defined_terms"][:def_cap]
 			else:
 				# Extract likely defined terms: Words in Title Case or ALLCAPS in quotes
 				caps = re.findall(r"\b([A-Z][A-Za-z0-9\-]{2,})\b", r.get("content", ""))
-				candidate_terms = list({t for t in caps if len(t) <= 30})[:MAX_DEF_MATCH]
+				candidate_terms = list({t for t in caps if len(t) <= 30})[:def_cap]
 
 			if have_ct:
 				# fetch Definitions sections in same document that contain any of the terms
@@ -441,7 +404,7 @@ def _attach_neighbors_and_defs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any
 							r["document_id"],
 							candidate_terms,
 							["%" + t + "%" for t in candidate_terms],
-							MAX_DEF_MATCH,
+							def_cap,
 						),
 					)
 					r["definitions"] = [
@@ -513,10 +476,24 @@ def search_hybrid(
 	expand_sparse: bool = True,
 	sparse_weight: float = 0.6,
 	must_tokens: Optional[List[str]] = None,
+	must_not_tokens: Optional[List[str]] = None,
+	should_tokens: Optional[List[str]] = None,
+	should_weight: float = 0.05,
 	heading_like: Optional[str] = None,
+	filter_doc_type: Optional[str] = None,
+	filter_industry: Optional[str] = None,
+	filter_law: Optional[str] = None,
+	filter_seat: Optional[str] = None,
+	filter_doc_id: Optional[str] = None,
+	prefer_doc: Optional[str] = None,
+	enforce_constraints: bool = False,
+	neighbor_window: Optional[int] = None,
+	max_defs: Optional[int] = None,
+	explain: bool = False,
 ) -> List[Dict[str, Any]]:
 	"""Cosine ANN + weighted FTS, fused by RRF. Returns rows with rrf score + context.
 	Optionally require must_tokens (all must appear via ILIKE) to prefilter candidates.
+	Supports must_not and should tokens, optional metadata filters and boosts, and heading/doc filters.
 	"""
 	_ensure_schema()
 	_ensure_vector_index()
@@ -528,9 +505,29 @@ def search_hybrid(
 	q_fts = _expand_for_fts(query) if expand_sparse else query
 	probes = probes or IVFFLAT_PROBES
 	rrf_k = rrf_k or RRF_K
-	must_count = len(must_tokens) if must_tokens else 0
-	patterns = [f"%{t}%" for t in (must_tokens or [])]
-
+	must = must_tokens or []
+	must_not = must_not_tokens or []
+	should = should_tokens or []
+	patterns = [f"%{t}%" for t in must]
+	patterns_not = [f"%{t}%" for t in must_not]
+	patterns_should = [f"%{t}%" for t in should]
+	# derive a content fallback for law if metadata is missing
+	law_like = None
+	if filter_law:
+		_l = filter_law.strip().lower()
+		law_map = {
+			"ny": "%New York%",
+			"us-ny": "%New York%",
+			"new york": "%New York%",
+			"de": "%Delaware%",
+			"us-de": "%Delaware%",
+			"delaware": "%Delaware%",
+			"ca": "%California%",
+			"us-ca": "%California%",
+			"california": "%California%",
+		}
+		law_like = law_map.get(_l)
+ 
 	with _connect() as conn, conn.cursor(row_factory=dict_row) as cur:
 		cur.execute(f"SET LOCAL ivfflat.probes = {int(probes)}")
 		cur.execute(
@@ -543,44 +540,93 @@ def search_hybrid(
 					 %s::int AS k,
 					 %s::int AS must_n,
 					 %s::text[] AS must_patterns,
+					 %s::int AS must_not_n,
+					 %s::text[] AS must_not_patterns,
+					 %s::int AS should_n,
+					 %s::text[] AS should_patterns,
 					 %s::float AS sparse_w,
-					 %s::text AS heading_like
+					 %s::float AS should_w,
+					 %s::text AS heading_like,
+					 %s::text AS law,
+					 %s::text AS law_like,
+					 %s::text AS industry,
+					 %s::text AS doc_type,
+					 %s::text AS seat,
+					 %s::text AS prefer_doc,
+					 %s::text AS filter_doc_id,
+					 %s::boolean AS enforce_constraints
 			),
 			dense AS (
-			  SELECT id,
-					 row_number() OVER (ORDER BY embedding <-> (SELECT qvec FROM params)) AS r_dense
+			  SELECT c.id,
+					 row_number() OVER (ORDER BY c.embedding <-> (SELECT qvec FROM params)) AS r_dense
 			  FROM clauses c
-			  WHERE embedding IS NOT NULL
-			    AND ( (SELECT heading_like FROM params) IS NULL OR c.heading_number LIKE (SELECT heading_like FROM params) )
+			  JOIN documents d ON d.document_id = c.document_id
+			  WHERE c.embedding IS NOT NULL
+			    AND ( (SELECT heading_like FROM params) IS NULL
+			          OR c.heading_number LIKE (SELECT heading_like FROM params)
+			          OR c.clause_number  LIKE (SELECT heading_like FROM params) )
+			    AND ( (SELECT filter_doc_id FROM params) IS NULL OR c.document_id = (SELECT filter_doc_id FROM params) )
 			    AND (
 			      (SELECT must_n FROM params)=0 OR (
 			        SELECT bool_and(c.content ILIKE p)
 			        FROM unnest((SELECT must_patterns FROM params)) AS p
 			      )
 			    )
-			  ORDER BY embedding <-> (SELECT qvec FROM params)
+			    AND (
+			      (SELECT must_not_n FROM params)=0 OR NOT (
+			        SELECT bool_or(c.content ILIKE p)
+			        FROM unnest((SELECT must_not_patterns FROM params)) AS p
+			      )
+			    )
+			    AND (
+			      (SELECT enforce_constraints FROM params) = FALSE OR (
+			        ((SELECT law FROM params) IS NULL OR d.governing_law = (SELECT law FROM params)
+			         OR (d.governing_law IS NULL AND (SELECT law_like FROM params) IS NOT NULL AND c.content ILIKE (SELECT law_like FROM params))) AND
+			        ((SELECT industry FROM params) IS NULL OR d.industry = (SELECT industry FROM params)) AND
+			        ((SELECT doc_type FROM params) IS NULL OR d.document_type = (SELECT doc_type FROM params))
+			      )
+			    )
+			  ORDER BY c.embedding <-> (SELECT qvec FROM params)
 			  LIMIT (SELECT pool_n FROM params)
 			),
 			sparse AS (
-			  SELECT id,
+			  SELECT c.id,
 					 row_number() OVER (
 					   ORDER BY (
-					     ts_rank_cd(fts, (SELECT q FROM params), 32)
-					     + 0.2 * ts_rank_cd(fts_simple, (SELECT q_simple FROM params))
+					     ts_rank_cd(c.fts, (SELECT q FROM params), 32)
+					     + 0.2 * ts_rank_cd(c.fts_simple, (SELECT q_simple FROM params))
 					   ) DESC
 					 ) AS r_sparse
 			  FROM clauses c
-			  WHERE fts @@ (SELECT q FROM params)
-			    AND ( (SELECT heading_like FROM params) IS NULL OR c.heading_number LIKE (SELECT heading_like FROM params) )
+			  JOIN documents d ON d.document_id = c.document_id
+			  WHERE c.fts @@ (SELECT q FROM params)
+			    AND ( (SELECT heading_like FROM params) IS NULL
+			          OR c.heading_number LIKE (SELECT heading_like FROM params)
+			          OR c.clause_number  LIKE (SELECT heading_like FROM params) )
+			    AND ( (SELECT filter_doc_id FROM params) IS NULL OR c.document_id = (SELECT filter_doc_id FROM params) )
 			    AND (
 			      (SELECT must_n FROM params)=0 OR (
 			        SELECT bool_and(c.content ILIKE p)
 			        FROM unnest((SELECT must_patterns FROM params)) AS p
 			      )
 			    )
+			    AND (
+			      (SELECT must_not_n FROM params)=0 OR NOT (
+			        SELECT bool_or(c.content ILIKE p)
+			        FROM unnest((SELECT must_not_patterns FROM params)) AS p
+			      )
+			    )
+			    AND (
+			      (SELECT enforce_constraints FROM params) = FALSE OR (
+			        ((SELECT law FROM params) IS NULL OR d.governing_law = (SELECT law FROM params)
+			         OR (d.governing_law IS NULL AND (SELECT law_like FROM params) IS NOT NULL AND c.content ILIKE (SELECT law_like FROM params))) AND
+			        ((SELECT industry FROM params) IS NULL OR d.industry = (SELECT industry FROM params)) AND
+			        ((SELECT doc_type FROM params) IS NULL OR d.document_type = (SELECT doc_type FROM params))
+			      )
+			    )
 			  ORDER BY (
-					 ts_rank_cd(fts, (SELECT q FROM params), 32)
-					 + 0.2 * ts_rank_cd(fts_simple, (SELECT q_simple FROM params))
+					 ts_rank_cd(c.fts, (SELECT q FROM params), 32)
+					 + 0.2 * ts_rank_cd(c.fts_simple, (SELECT q_simple FROM params))
 				) DESC
 			  LIMIT (SELECT pool_n FROM params)
 			),
@@ -594,41 +640,80 @@ def search_hybrid(
 			  FROM unioned GROUP BY id
 			),
 			fused AS (
-			  SELECT id,
-					 (SELECT sparse_w FROM params) * COALESCE(1.0/((SELECT k FROM params) + r_sparse), 0.0)
-					 + (1.0 - (SELECT sparse_w FROM params)) * COALESCE(1.0/((SELECT k FROM params) + r_dense), 0.0) AS rrf
-			  FROM agg
+			  SELECT a.id,
+					 (SELECT sparse_w FROM params) * COALESCE(1.0/((SELECT k FROM params) + a.r_sparse), 0.0)
+				   + (1.0 - (SELECT sparse_w FROM params)) * COALESCE(1.0/((SELECT k FROM params) + a.r_dense), 0.0)
+				   + (SELECT should_w FROM params) * (
+						SELECT COALESCE(AVG(CASE WHEN c.content ILIKE p THEN 1.0 ELSE 0.0 END),0.0)
+						FROM unnest((SELECT should_patterns FROM params)) AS p, clauses c
+						WHERE c.id = a.id
+					 )
+				   + 0.10 * CASE WHEN (SELECT law FROM params) IS NOT NULL AND d.governing_law = (SELECT law FROM params) THEN 1 ELSE 0 END
+				   + 0.10 * CASE WHEN (SELECT doc_type FROM params) IS NOT NULL AND d.document_type = (SELECT doc_type FROM params) THEN 1 ELSE 0 END
+				   + 0.10 * CASE WHEN (SELECT industry FROM params) IS NOT NULL AND d.industry = (SELECT industry FROM params) THEN 1 ELSE 0 END
+				   + 0.15 * CASE WHEN (SELECT prefer_doc FROM params) IS NOT NULL AND c.document_id = (SELECT prefer_doc FROM params) THEN 1 ELSE 0 END AS rrf,
+				 a.r_dense, a.r_sparse
+			  FROM agg a
+			  JOIN clauses c ON c.id=a.id
+			  JOIN documents d ON d.document_id = c.document_id
 			)
-			SELECT c.id, c.document_id, c.section_id, c.title, c.content, f.rrf
+			SELECT c.id, c.document_id, c.section_id, c.title, c.content, f.rrf, f.r_dense, f.r_sparse,
+			       c.heading_number, c.seq, c.clause_type, c.defined_terms,
+			       d.document_type, d.governing_law, d.industry
 			FROM fused f
 			JOIN clauses c ON c.id=f.id
+			JOIN documents d ON d.document_id = c.document_id
 			ORDER BY f.rrf DESC
 			LIMIT %s
 			""",
-			(qvec_lit, q_fts, query, pool_n, rrf_k, must_count, patterns, float(sparse_weight), heading_like, top_k),
+			(
+				qvec_lit, q_fts, query, pool_n, rrf_k,
+				len(must), patterns,
+				len(must_not), patterns_not,
+				len(should), patterns_should,
+				float(sparse_weight), float(should_weight),
+				heading_like,
+				filter_law,
+				law_like,
+				filter_industry,
+				filter_doc_type,
+				filter_seat,
+				prefer_doc,
+				filter_doc_id,
+				bool(enforce_constraints),
+				top_k,
+			),
 		)
 		rows = cur.fetchall()
 
 	# De-dupe by (document_id, section_id)
 	seen = set()
-	uniq = []
+	uniq: List[Dict[str, Any]] = []
 	for r in rows:
 		key = (r["document_id"], r["section_id"])
 		if key in seen:
 			continue
 		seen.add(key)
-		uniq.append(
-			{
-				"id": r["id"],
-				"document_id": r["document_id"],
-				"section_id": r["section_id"],
-				"title": r["title"],
-				"content": r["content"],
-				"rrf": float(r["rrf"]),
-			}
-		)
+		item = {
+			"id": r["id"],
+			"document_id": r["document_id"],
+			"section_id": r["section_id"],
+			"title": r["title"],
+			"content": r["content"],
+			"rrf": float(r["rrf"]) if r["rrf"] is not None else None,
+			"r_dense": int(r["r_dense"]) if r.get("r_dense") is not None else None,
+			"r_sparse": int(r["r_sparse"]) if r.get("r_sparse") is not None else None,
+			"heading_number": r.get("heading_number"),
+			"seq": r.get("seq"),
+			"clause_type": r.get("clause_type"),
+			"defined_terms": r.get("defined_terms"),
+			"document_type": r.get("document_type"),
+			"governing_law": r.get("governing_law"),
+			"industry": r.get("industry"),
+		}
+		uniq.append(item)
 
-	return _attach_neighbors_and_defs(uniq)
+	return _attach_neighbors_and_defs(uniq, neighbor_window=neighbor_window, max_def_match=max_defs)
 
 
 # ---------------------------
@@ -677,15 +762,16 @@ def retrieve(
 	pool_n: int = 200,
 	use_hybrid: bool = True,
 	expand_sparse: bool = True,
+	**kwargs: Any,
 ) -> List[Dict[str, Any]]:
 	"""End-to-end retrieval: hybrid by default; dense-only if use_hybrid=False."""
 	if use_hybrid:
 		return search_hybrid(
-			query=query, pool_n=pool_n, top_k=top_k, expand_sparse=expand_sparse
+			query=query, pool_n=pool_n, top_k=top_k, expand_sparse=expand_sparse, **kwargs
 		)
 	qvec = _embed_query(query)
 	rows = _search_dense(qvec, limit=top_k)
-	return _attach_neighbors_and_defs(rows)
+	return _attach_neighbors_and_defs(rows, neighbor_window=kwargs.get("neighbor_window"), max_def_match=kwargs.get("max_defs"))
 
 
 # ---------------------------
@@ -698,9 +784,13 @@ def _ensure_graph_schema() -> None:
 		cur.execute(
 			"""
 			ALTER TABLE IF EXISTS clauses
-			  ADD COLUMN IF NOT EXISTS heading_number text
+			  ADD COLUMN IF NOT EXISTS heading_number text,
+			  ADD COLUMN IF NOT EXISTS clause_number  text
 			"""
 		)
+		# Pattern ops indexes for fast prefix LIKE
+		cur.execute("CREATE INDEX IF NOT EXISTS clauses_heading_like_idx ON clauses (heading_number text_pattern_ops)")
+		cur.execute("CREATE INDEX IF NOT EXISTS clauses_clause_like_idx  ON clauses (clause_number  text_pattern_ops)")
 		# Graph table
 		cur.execute(
 			"""
@@ -729,22 +819,47 @@ def _ensure_graph_schema() -> None:
 
 
 def _backfill_heading_numbers(document_id: Optional[str] = None) -> None:
-	"""Derive heading_number from section_id or title heuristics for fast mapping."""
+	"""Derive clause_number (dotted like 10.2.1) and top-level heading_number."""
 	with _connect() as conn, conn.cursor() as cur:
-		params = []
+		params: List[Any] = []
 		where = ""
 		if document_id:
 			where = "WHERE document_id = %s"
 			params.append(document_id)
-		# Prefer numeric section_id; else parse leading number tokens from title
 		cur.execute(
 			f"""
-			UPDATE clauses
-			SET heading_number = COALESCE(
-				NULLIF(regexp_replace(section_id, '[^0-9\.]', '', 'g'), ''),
-				substring(title from '(^[0-9]+(?:\.[0-9]+)*)')
+			WITH first_line AS (
+			  SELECT id,
+			         regexp_replace(
+			           NULLIF(regexp_replace(split_part(regexp_replace(content, E'\\r', '', 'g'), E'\\n', 1), '^\\s+', '', 'g'), ''),
+			           E'\\s+', ' ', 'g'
+			         ) AS line1
+			  FROM clauses {where}
 			)
-			{where}
+			UPDATE clauses c
+			SET clause_number = COALESCE(
+			        substring(c.title from '(^\\s*[0-9]+(?:\\.[0-9]+)*)'),
+			        (SELECT substring(line1 from '(^\\s*[0-9]+(?:\\.[0-9]+)*)') FROM first_line f WHERE f.id=c.id),
+			        NULLIF(regexp_replace(c.section_id, '[^0-9\\.]', '', 'g'), '')
+			     ),
+			    heading_number = COALESCE(
+			        CASE
+			          WHEN position('.' in COALESCE(
+			             substring(c.title from '(^\\s*[0-9]+(?:\\.[0-9]+)*)'),
+			             (SELECT substring(line1 from '(^\\s*[0-9]+(?:\\.[0-9]+)*)') FROM first_line f WHERE f.id=c.id),
+			             NULLIF(regexp_replace(c.section_id, '[^0-9\\.]', '', 'g'), '')
+			          )) > 0
+			          THEN split_part(
+			               COALESCE(
+			                 substring(c.title from '(^\\s*[0-9]+(?:\\.[0-9]+)*)'),
+			                 (SELECT substring(line1 from '(^\\s*[0-9]+(?:\\.[0-9]+)*)') FROM first_line f WHERE f.id=c.id),
+			                 NULLIF(regexp_replace(c.section_id, '[^0-9\\.]', '', 'g'), '')
+			               ), '.', 1)
+			          ELSE NULLIF(regexp_replace(c.section_id, '[^0-9]', '', 'g'), '')
+			        END
+			     )
+			WHERE TRUE
+			  {"AND c.document_id = %s" if document_id else ""}
 			""",
 			tuple(params),
 		)
@@ -882,7 +997,7 @@ def _populate_defines_edges(document_id: Optional[str] = None) -> None:
 			for d in def_rows:
 				text = d.get("content") or ""
 				# "Term" means ... or Title Case terms
-				terms += re.findall(r'"([^\"]{2,40})"\s*(?:means|shall\s+mean)', text, flags=re.IGNORECASE)
+				terms += re.findall(r'"([^\\"]{2,40})"\s*(?:means|shall\s+mean)', text, flags=re.IGNORECASE)
 			# de-dup and limit
 			terms = [t.strip() for t in terms if t.strip()]
 			terms = list(dict.fromkeys(terms))[:128]
@@ -935,19 +1050,20 @@ def _fetch_clause_rows(ids: List[int]) -> List[Dict[str, Any]]:
 		return [dict(r) for r in cur.fetchall()]
 
 
-def retrieve_recursive(query: str, k: int = 8, max_hops: int = 2) -> List[Dict[str, Any]]:
-	"""Hybrid search seeds + follow refers_to/defines edges up to max_hops."""
+def retrieve_recursive(query: str, k: int = 8, max_hops: int = 2, relations: Optional[List[str]] = None, neighbor_window: Optional[int] = None, max_defs: Optional[int] = None) -> List[Dict[str, Any]]:
+	"""Hybrid search seeds + follow refers_to/defines edges up to max_hops. Supports relation filtering and neighbor/defs overrides."""
 	_ensure_schema()
 	_ensure_vector_index()
 	_ensure_fts()
 	_ensure_graph_schema()
-	seeds = search_hybrid(query, pool_n=200, top_k=k)
+	seeds = search_hybrid(query, pool_n=200, top_k=k, neighbor_window=neighbor_window, max_defs=max_defs)
 	seen = {int(r["id"]) for r in seeds}
 	frontier = [int(r["id"]) for r in seeds]
 	hops = 0
 	out = list(seeds)
+	rel_tuple: Tuple[str, ...] = tuple((relations or ["refers_to","defines"]))
 	while frontier and hops < max_hops:
-		dsts = _fetch_edges(frontier, relation_in=("refers_to","defines"))
+		dsts = _fetch_edges(frontier, relation_in=rel_tuple)
 		new_ids = [i for i in dsts if i not in seen]
 		if not new_ids:
 			break
@@ -957,4 +1073,5 @@ def retrieve_recursive(query: str, k: int = 8, max_hops: int = 2) -> List[Dict[s
 			seen.add(i)
 		frontier = new_ids
 		hops += 1
-	return out 
+	# Attach neighbors/defs across the final set
+	return _attach_neighbors_and_defs(out, neighbor_window=neighbor_window, max_def_match=max_defs) 
