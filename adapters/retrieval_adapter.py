@@ -629,18 +629,6 @@ def ingest_data_dir(data_dir: str = "./data") -> Dict[str, Any]:
 		num_docs += 1
 		num_chunks += len(chunks)
 
-	# refresh FTS vectors for new rows
-	with _connect() as conn, conn.cursor() as cur:
-		cur.execute(
-			"""
-			UPDATE clauses SET content_tsv =
-			  setweight(to_tsvector('english', unaccent(coalesce(title,''))), 'A') ||
-			  setweight(to_tsvector('english', unaccent(coalesce(content,''))), 'B')
-			WHERE content_tsv IS NULL OR content_tsv = ''
-			"""
-		)
-		conn.commit()
-
 	return {"documents_indexed": num_docs, "chunks_indexed": num_chunks}
 
 
@@ -661,4 +649,254 @@ def retrieve(
 		)
 	qvec = _embed_query(query)
 	rows = _search_dense(qvec, limit=top_k)
-	return _attach_neighbors_and_defs(rows) 
+	return _attach_neighbors_and_defs(rows)
+
+
+# ---------------------------
+# Clause graph schema & population
+# ---------------------------
+
+def _ensure_graph_schema() -> None:
+	with _connect() as conn, conn.cursor() as cur:
+		# Add heading_number column for numeric section identifiers
+		cur.execute(
+			"""
+			ALTER TABLE IF EXISTS clauses
+			  ADD COLUMN IF NOT EXISTS heading_number text
+			"""
+		)
+		# Graph table
+		cur.execute(
+			"""
+			CREATE TABLE IF NOT EXISTS clause_edges (
+			  src_clause_id bigint REFERENCES clauses(id),
+			  dst_clause_id bigint REFERENCES clauses(id),
+			  relation text CHECK (relation IN ('refers_to','defines','adjacent','same_type')),
+			  weight float DEFAULT 1.0
+			)
+			"""
+		)
+		# Unique + lookup indexes
+		cur.execute(
+			"""
+			CREATE UNIQUE INDEX IF NOT EXISTS clause_edges_unique
+			ON clause_edges(src_clause_id, dst_clause_id, relation)
+			"""
+		)
+		cur.execute(
+			"""
+			CREATE INDEX IF NOT EXISTS clause_edges_src
+			ON clause_edges(src_clause_id, relation)
+			"""
+		)
+		conn.commit()
+
+
+def _backfill_heading_numbers(document_id: Optional[str] = None) -> None:
+	"""Derive heading_number from section_id or title heuristics for fast mapping."""
+	with _connect() as conn, conn.cursor() as cur:
+		params = []
+		where = ""
+		if document_id:
+			where = "WHERE document_id = %s"
+			params.append(document_id)
+		# Prefer numeric section_id; else parse leading number tokens from title
+		cur.execute(
+			f"""
+			UPDATE clauses
+			SET heading_number = COALESCE(
+				NULLIF(regexp_replace(section_id, '[^0-9\.]', '', 'g'), ''),
+				substring(title from '(^[0-9]+(?:\.[0-9]+)*)')
+			)
+			{where}
+			""",
+			tuple(params),
+		)
+		conn.commit()
+
+
+def _populate_adjacent_edges(document_id: Optional[str] = None) -> int:
+	with _connect() as conn, conn.cursor() as cur:
+		params = []
+		where = ""
+		if document_id:
+			where = "WHERE document_id = %s"
+			params.append(document_id)
+		# Use ID order per document as a proxy sequence
+		cur.execute(
+			f"""
+			WITH ordered AS (
+			  SELECT id, document_id,
+					lag(id) OVER (PARTITION BY document_id ORDER BY id) AS prev_id,
+					lead(id) OVER (PARTITION BY document_id ORDER BY id) AS next_id
+			  FROM clauses
+			  {where}
+			)
+			INSERT INTO clause_edges (src_clause_id, dst_clause_id, relation, weight)
+			SELECT id, prev_id, 'adjacent', 1.0 FROM ordered WHERE prev_id IS NOT NULL
+			ON CONFLICT DO NOTHING;
+			""",
+			tuple(params),
+		)
+		cur.execute(
+			f"""
+			WITH ordered AS (
+			  SELECT id, document_id,
+					lag(id) OVER (PARTITION BY document_id ORDER BY id) AS prev_id,
+					lead(id) OVER (PARTITION BY document_id ORDER BY id) AS next_id
+			  FROM clauses
+			  {where}
+			)
+			INSERT INTO clause_edges (src_clause_id, dst_clause_id, relation, weight)
+			SELECT id, next_id, 'adjacent', 1.0 FROM ordered WHERE next_id IS NOT NULL
+			ON CONFLICT DO NOTHING;
+			""",
+			tuple(params),
+		)
+		conn.commit()
+		# Can't easily return rows inserted; ignore
+		return 0
+
+
+def _populate_refers_to_edges(document_id: Optional[str] = None) -> None:
+	"""Scan content for references like 'Section 6.2' or 'Clause 14.1' and link within same document."""
+	_backfill_heading_numbers(document_id)
+	with _connect() as conn, conn.cursor(row_factory=dict_row) as cur:
+		doc_clause_map: Dict[str, Dict[str, int]] = {}
+		# Build mapping document_id -> {heading_number: id}
+		params = []
+		where = ""
+		if document_id:
+			where = "WHERE document_id = %s"
+			params.append(document_id)
+		cur.execute(f"SELECT id, document_id, heading_number FROM clauses {where}", tuple(params))
+		for row in cur.fetchall():
+			hn = row["heading_number"]
+			if not hn:
+				continue
+			doc_clause_map.setdefault(row["document_id"], {})[hn] = row["id"]
+		# Scan contents for refs
+		cur.execute(f"SELECT id, document_id, content FROM clauses {where}", tuple(params))
+		rows = cur.fetchall()
+		ref_re = re.compile(r"\b(?:Section|Clause|§|¶)?\s*([0-9]+(?:\.[0-9]+)*)")
+		for r in rows:
+			text = r.get("content") or ""
+			candidates = set(m.group(1) for m in ref_re.finditer(text))
+			if not candidates:
+				continue
+			mapping = doc_clause_map.get(r["document_id"], {})
+			for num in candidates:
+				dst = mapping.get(num)
+				if dst:
+					cur.execute(
+						"INSERT INTO clause_edges (src_clause_id, dst_clause_id, relation, weight) VALUES (%s,%s,'refers_to',1.0) ON CONFLICT DO NOTHING",
+						(r["id"], dst),
+					)
+		conn.commit()
+
+
+def _populate_defines_edges(document_id: Optional[str] = None) -> None:
+	"""Link from Definitions clauses to clauses using those terms."""
+	with _connect() as conn, conn.cursor(row_factory=dict_row) as cur:
+		params = []
+		where = ""
+		if document_id:
+			where = "WHERE document_id = %s"
+			params.append(document_id)
+		# Get candidate definition clauses by title heuristic
+		cur.execute(
+			f"SELECT id, document_id, title, content FROM clauses {where}",
+			tuple(params),
+		)
+		defs_by_doc: Dict[str, List[Dict[str, Any]]] = {}
+		for row in cur.fetchall():
+			title = (row.get("title") or "").lower()
+			if "definition" in title:
+				defs_by_doc.setdefault(row["document_id"], []).append(row)
+		# Build rows per doc to scan
+		cur.execute(
+			f"SELECT id, document_id, content FROM clauses {where}",
+			tuple(params),
+		)
+		all_rows = cur.fetchall()
+		for doc, def_rows in defs_by_doc.items():
+			terms: List[str] = []
+			for d in def_rows:
+				text = d.get("content") or ""
+				# "Term" means ... or Title Case terms
+				terms += re.findall(r'"([^\"]{2,40})"\s*(?:means|shall\s+mean)', text, flags=re.IGNORECASE)
+			# de-dup and limit
+			terms = [t.strip() for t in terms if t.strip()]
+			terms = list(dict.fromkeys(terms))[:128]
+			if not terms:
+				continue
+			# link to any clause containing term
+			like_list = [f"%{t}%" for t in terms]
+			for row in all_rows:
+				if row["document_id"] != doc:
+					continue
+				content = row.get("content") or ""
+				if any(t in content for t in terms):
+					for d in def_rows:
+						cur.execute(
+							"INSERT INTO clause_edges (src_clause_id, dst_clause_id, relation, weight) VALUES (%s,%s,'defines',1.0) ON CONFLICT DO NOTHING",
+							(d["id"], row["id"]),
+						)
+		conn.commit()
+
+
+def populate_clause_graph(document_id: Optional[str] = None) -> None:
+	"""Public helper: ensure schema and populate adjacent/refers_to/defines edges."""
+	_ensure_graph_schema()
+	_backfill_heading_numbers(document_id)
+	_populate_adjacent_edges(document_id)
+	_populate_refers_to_edges(document_id)
+	_populate_defines_edges(document_id)
+
+
+def _fetch_edges(src_ids: List[int], relation_in: Tuple[str, ...] = ("refers_to","defines")) -> List[int]:
+	if not src_ids:
+		return []
+	with _connect() as conn, conn.cursor() as cur:
+		cur.execute(
+			"SELECT DISTINCT dst_clause_id FROM clause_edges WHERE src_clause_id = ANY(%s) AND relation = ANY(%s)",
+			(src_ids, list(relation_in)),
+		)
+		rows = cur.fetchall()
+	return [r[0] for r in rows if r and r[0] is not None]
+
+
+def _fetch_clause_rows(ids: List[int]) -> List[Dict[str, Any]]:
+	if not ids:
+		return []
+	with _connect() as conn, conn.cursor(row_factory=dict_row) as cur:
+		cur.execute(
+			"SELECT id, document_id, section_id, title, content FROM clauses WHERE id = ANY(%s)",
+			(ids,),
+		)
+		return [dict(r) for r in cur.fetchall()]
+
+
+def retrieve_recursive(query: str, k: int = 8, max_hops: int = 2) -> List[Dict[str, Any]]:
+	"""Hybrid search seeds + follow refers_to/defines edges up to max_hops."""
+	_ensure_schema()
+	_ensure_vector_index()
+	_ensure_fts()
+	_ensure_graph_schema()
+	seeds = search_hybrid(query, pool_n=200, top_k=k)
+	seen = {int(r["id"]) for r in seeds}
+	frontier = [int(r["id"]) for r in seeds]
+	hops = 0
+	out = list(seeds)
+	while frontier and hops < max_hops:
+		dsts = _fetch_edges(frontier, relation_in=("refers_to","defines"))
+		new_ids = [i for i in dsts if i not in seen]
+		if not new_ids:
+			break
+		ctx = _fetch_clause_rows(new_ids)
+		out.extend(ctx)
+		for i in new_ids:
+			seen.add(i)
+		frontier = new_ids
+		hops += 1
+	return out 
