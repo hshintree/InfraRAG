@@ -3,12 +3,16 @@ from __future__ import annotations
 import argparse, json, os, time
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # project import
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
+
+# Force local embeddings for this process before importing retriever (import reads env)
+os.environ["USE_MODAL_EMBED"] = "0"
 
 from adapters.retrieval_adapter import search_hybrid  # you already expose this
 
@@ -332,6 +336,7 @@ def main():
     ap.add_argument("--pool-n", type=int, default=300)
     ap.add_argument("--no-optional", action="store_true")
     ap.add_argument("--out", default="artifacts")
+    ap.add_argument("--parallel", type=int, default=0, help="Parallel slot retrieval (threads); 0=off")
     args = ap.parse_args()
 
     spec = _default_spec()
@@ -339,7 +344,33 @@ def main():
         with open(args.spec_file, "r") as f:
             spec = json.load(f)
 
-    scp = build_scp(spec, include_optional=not args.no_optional, top_k=args.top_k, pool_n=args.pool_n)
+    # Optionally run slot retrievals in parallel
+    if args.parallel and args.parallel > 0:
+        req = spec.get("required", [])
+        opt = [] if args.no_optional else spec.get("optional", [])
+        slot_list = req + opt
+        results: Dict[str, Any] = {}
+        with ThreadPoolExecutor(max_workers=args.parallel) as ex:
+            futs = {ex.submit(retrieve_slot, name, spec, args.top_k, args.pool_n): name for name in slot_list}
+            for fut in as_completed(futs):
+                name = futs[fut]
+                results[name] = fut.result()
+        scp = {
+            "spec": spec,
+            "created_at": int(time.time()),
+            "slots": results,
+            "definitions_table": [d for s in results.values() for d in (s.get("definitions", []))],
+            "notes": {
+                "neighbor_window": 1,
+                "max_defs": 6,
+                "fusion": "RRF hybrid",
+                "scoped_rerun": True,
+                "merged_adjacent": True,
+                "parallel": args.parallel,
+            }
+        }
+    else:
+        scp = build_scp(spec, include_optional=not args.no_optional, top_k=args.top_k, pool_n=args.pool_n)
 
     os.makedirs(args.out, exist_ok=True)
     fname = os.path.join(args.out, f"scp_{int(time.time())}.json")

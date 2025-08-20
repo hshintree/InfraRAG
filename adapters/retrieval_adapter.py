@@ -335,12 +335,33 @@ def _expand_for_fts(query: str) -> str:
 	return f'{query} OR ' + " OR ".join(sorted(set(extras)))
 
 
+def _ensure_perf_indexes() -> None:
+	"""Ensure trigram and common lookup indexes exist for faster ILIKE and filters."""
+	with _connect() as conn, conn.cursor() as cur:
+		# Extensions
+		cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+		# Trigram GIN on large text columns used with ILIKE
+		cur.execute("CREATE INDEX IF NOT EXISTS clauses_content_trgm_idx ON clauses USING gin (content gin_trgm_ops)")
+		cur.execute("CREATE INDEX IF NOT EXISTS clauses_title_trgm_idx   ON clauses USING gin (title   gin_trgm_ops)")
+		# Cheap filters
+		cur.execute("CREATE INDEX IF NOT EXISTS clauses_heading_idx ON clauses(heading_number)")
+		cur.execute("CREATE INDEX IF NOT EXISTS clauses_doc_idx     ON clauses(document_id)")
+		cur.execute("CREATE INDEX IF NOT EXISTS clauses_clause_type_idx ON clauses(clause_type)")
+		# Documents metadata
+		cur.execute("CREATE INDEX IF NOT EXISTS documents_law_idx      ON documents(governing_law)")
+		cur.execute("CREATE INDEX IF NOT EXISTS documents_industry_idx ON documents(industry)")
+		cur.execute("CREATE INDEX IF NOT EXISTS documents_type_idx     ON documents(document_type)")
+		conn.commit()
+
+
 def _attach_neighbors_and_defs(rows: List[Dict[str, Any]], neighbor_window: Optional[int] = None, max_def_match: Optional[int] = None) -> List[Dict[str, Any]]:
-	"""Best-effort context expansion: ±window neighbors (requires seq), definitions (requires clause_type/defined_terms)."""
+	"""Best-effort context expansion batched: neighbors by doc/seq ranges; definitions per doc."""
 	if not rows:
 		return rows
 	window = NEIGHBOR_WINDOW if neighbor_window is None else int(neighbor_window)
 	def_cap = MAX_DEF_MATCH if max_def_match is None else int(max_def_match)
+	ids = [int(r["id"]) for r in rows if r.get("id") is not None]
+
 	with _connect() as conn, conn.cursor(row_factory=dict_row) as cur:
 		have_seq = _column_exists(cur, "clauses", "seq")
 		have_ct = _column_exists(cur, "clauses", "clause_type")
@@ -350,68 +371,99 @@ def _attach_neighbors_and_defs(rows: List[Dict[str, Any]], neighbor_window: Opti
 			r["neighbors"] = []
 			r["definitions"] = []
 
-			if have_seq:
-				cur.execute("SELECT seq FROM clauses WHERE id=%s", (r["id"],))
-				row = cur.fetchone()
-				if row and row["seq"] is not None:
-					seq = int(row["seq"])
-					cur.execute(
-						"""
-						SELECT section_id, title, content
-						FROM clauses
-						WHERE document_id=%s AND seq BETWEEN %s AND %s
-						ORDER BY seq
-						""",
-						(r["document_id"], seq - window, seq + window),
-					)
-					r["neighbors"] = [
-						{"section_id": x["section_id"], "title": x["title"], "content": x["content"]}
-						for x in cur.fetchall()
-						if x is not None
-					]
+		if not have_seq and not have_ct:
+			return rows
 
-			# naive uppercase-defined-terms fallback if defined_terms col is missing
-			candidate_terms: List[str] = []
-			if have_defs:
-				cur.execute("SELECT defined_terms FROM clauses WHERE id=%s", (r["id"],))
-				termrow = cur.fetchone()
-				if termrow and termrow["defined_terms"]:
-					candidate_terms = termrow["defined_terms"][:def_cap]
+		# 1) fetch seq/doc for all rows in one shot
+		seq_map: Dict[int, Optional[int]] = {}
+		doc_map: Dict[int, str] = {}
+		if have_seq and ids:
+			cur.execute("SELECT id, document_id, seq FROM clauses WHERE id = ANY(%s)", (ids,))
+			for x in cur.fetchall():
+				seq_map[int(x["id"])] = None if x["seq"] is None else int(x["seq"])
+				doc_map[int(x["id"])] = x["document_id"]
+
+		# 2) neighbors: batch by (document_id, min_seq..max_seq)
+		if have_seq and window > 0:
+			by_doc: Dict[str, List[int]] = {}
+			for r in rows:
+				sid = int(r["id"]) if r.get("id") is not None else None
+				if sid is None:
+					continue
+				if sid in doc_map and seq_map.get(sid) is not None:
+					by_doc.setdefault(doc_map[sid], []).append(seq_map[sid])
+			# one query per doc
+			for doc_id, seqs in by_doc.items():
+				lo = min(seqs) - window
+				hi = max(seqs) + window
+				cur.execute(
+					"""
+					SELECT seq, section_id, title, content
+					FROM clauses
+					WHERE document_id=%s AND seq BETWEEN %s AND %s
+					ORDER BY seq
+					""",
+					(doc_id, lo, hi),
+				)
+				neighbors_all = cur.fetchall()
+				by_seq: Dict[int, Dict[str, Any]] = {}
+				for n in neighbors_all:
+					s = int(n["seq"]) if n["seq"] is not None else None
+					if s is not None:
+						by_seq[s] = {"section_id": n["section_id"], "title": n["title"], "content": n["content"]}
+				# attach per row
+				for r in rows:
+					sid = int(r["id"]) if r.get("id") is not None else None
+					if sid is None or doc_map.get(sid) != doc_id:
+						continue
+					s = seq_map.get(sid)
+					if s is None:
+						continue
+					r["neighbors"] = [by_seq[s2] for s2 in range(s - window, s + window + 1) if s2 in by_seq]
+
+		# 3) definitions: batch term collection then one pass per doc
+		if have_ct:
+			terms_by_doc: Dict[str, List[str]] = {}
+			if have_defs and ids:
+				cur.execute("SELECT id, document_id, defined_terms FROM clauses WHERE id = ANY(%s)", (ids,))
+				for x in cur.fetchall():
+					if not x["defined_terms"]:
+						continue
+					did = x["document_id"]
+					terms_by_doc.setdefault(did, [])
+					terms_by_doc[did].extend(list(x["defined_terms"]))
 			else:
-				# Extract likely defined terms: Words in Title Case or ALLCAPS in quotes
-				caps = re.findall(r"\b([A-Z][A-Za-z0-9\-]{2,})\b", r.get("content", ""))
-				candidate_terms = list({t for t in caps if len(t) <= 30})[:def_cap]
-
-			if have_ct:
-				# fetch Definitions sections in same document that contain any of the terms
-				if candidate_terms:
-					cur.execute(
-						"""
-						SELECT section_id, title, content
-						FROM clauses
-						WHERE document_id=%s
-						  AND clause_type='Definitions'
-						  AND (
-								EXISTS (
-								  SELECT 1 FROM unnest(defined_terms) t
-								  WHERE t = ANY(%s)
-								)
-							OR content ILIKE ANY(%s)
-						  )
-						LIMIT %s
-						""",
-						(
-							r["document_id"],
-							candidate_terms,
-							["%" + t + "%" for t in candidate_terms],
-							def_cap,
-						),
-					)
-					r["definitions"] = [
-						{"section_id": x["section_id"], "title": x["title"], "content": x["content"]}
-						for x in cur.fetchall()
-						if x is not None
-					]
+				for r in rows:
+					text = r.get("content") or ""
+					caps = re.findall(r"\b([A-Z][A-Za-z0-9\-]{2,})\b", text)
+					if caps:
+						terms_by_doc.setdefault(r["document_id"], []).extend(caps)
+			# de-dupe and cap
+			for d in list(terms_by_doc):
+				dedup = list(dict.fromkeys(t.strip() for t in terms_by_doc[d] if t.strip()))
+				terms_by_doc[d] = dedup[:def_cap]
+			# fetch matching Definitions once per doc and attach
+			for doc_id, terms in terms_by_doc.items():
+				if not terms:
+					continue
+				like_list = ["%" + t + "%" for t in terms]
+				cur.execute(
+					"""
+					SELECT section_id, title, content
+					FROM clauses
+					WHERE document_id=%s
+					  AND clause_type='Definitions'
+					  AND (content ILIKE ANY(%s)
+					       OR EXISTS (
+					          SELECT 1 FROM unnest(defined_terms) t WHERE t = ANY(%s)
+					       ))
+					""",
+					(doc_id, like_list, terms),
+				)
+				defs = [dict(x) for x in cur.fetchall()]
+				for r in rows:
+					if r["document_id"] == doc_id:
+						r["definitions"] = defs[:def_cap]
 	return rows
 
 
@@ -459,6 +511,9 @@ def search(query: str, top_k: int = 15) -> List[Dict[str, Any]]:
 	"""Dense-only (cosine) search."""
 	_ensure_schema()
 	_ensure_vector_index()
+	_ensure_fts()
+	_ensure_uniqueness_guard()
+	_ensure_perf_indexes()
 	qvec = _embed_query(query)
 	rows = _search_dense(qvec, limit=top_k)
 	return _attach_neighbors_and_defs(rows)
@@ -499,6 +554,7 @@ def search_hybrid(
 	_ensure_vector_index()
 	_ensure_fts()
 	_ensure_uniqueness_guard()
+	_ensure_perf_indexes()
 
 	qvec = _embed_query(query)
 	qvec_lit = _vector_to_sql_literal(qvec)
@@ -729,6 +785,7 @@ def ingest_data_dir(data_dir: str = "./data") -> Dict[str, Any]:
 	_ensure_vector_index()
 	_ensure_fts()
 	_ensure_uniqueness_guard()
+	_ensure_perf_indexes()
 
 	path = Path(data_dir)
 	files: List[str] = []
@@ -1056,6 +1113,7 @@ def retrieve_recursive(query: str, k: int = 8, max_hops: int = 2, relations: Opt
 	_ensure_vector_index()
 	_ensure_fts()
 	_ensure_graph_schema()
+	_ensure_perf_indexes()
 	seeds = search_hybrid(query, pool_n=200, top_k=k, neighbor_window=neighbor_window, max_defs=max_defs)
 	seen = {int(r["id"]) for r in seeds}
 	frontier = [int(r["id"]) for r in seeds]
