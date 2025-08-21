@@ -91,8 +91,19 @@ SLOT_HINTS: Dict[str, Dict[str, Any]] = {
 
     # Optional
     "Change of Control": {
-        "queries": ["change of control", "assignment by buyer", "assignment by seller"],
-        "should": ["change of control", "assignment", "acquisition", "transfer"],
+        "queries": [
+            "change of control",
+            "change in control",
+            "transfer of control",
+            "ownership change",
+            "assignment novation (control)"
+        ],
+        "must": ["control"],
+        "should": [
+            "change of control", "change in control", "majority", "voting",
+            "ownership", "assignment", "novation", "directly or indirectly"
+        ],
+        "must_not": ["tax", "transfer tax", "transfer taxes", "sales or use tax", "VAT"],
     },
     "Performance Guarantee": {
         "queries": ["guarantee", "parent guarantee", "letter of credit", "credit support"],
@@ -176,12 +187,13 @@ def _filters_from_spec(spec: Dict[str, Any], slot: str) -> Dict[str, Any]:
         filters["filter_industry"] = None
     return filters
 
+
 def _slot_query_and_tokens(slot: str, spec: Dict[str, Any]) -> Tuple[str, List[str], List[str], List[str], Optional[str]]:
     hints = SLOT_HINTS.get(slot, {"queries":[slot.lower()]})
     base_q = " ".join(hints.get("queries", [slot.lower()]))  # simple concat; works well with your RRF
     must = hints.get("must", [])
     should = hints.get("should", [])
-    must_not: List[str] = []
+    must_not: List[str] = hints.get("must_not", [])
 
     # Add constraint-guided tokens for key slots
     if slot == "Dispute Resolution":
@@ -200,10 +212,16 @@ def _slot_query_and_tokens(slot: str, spec: Dict[str, Any]) -> Tuple[str, List[s
         must = list(dict.fromkeys(must + ["govern"]))  # “governed by”
     return base_q, must, must_not, should, hints.get("heading_like")
 
+
 def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int = 300, scoped_top_k: int = 3, merge_adjacent: bool = True, merge_cap: int = 2200) -> Dict[str, Any]:
     base_q, must, must_not, should, heading_like = _slot_query_and_tokens(slot, spec)
     filters = _filters_from_spec(spec, slot)
     if heading_like: filters["heading_like"] = heading_like
+
+    # Allow more diversity for "fat" slots
+    fat_slots = {"R&W - Seller", "R&W - Buyer", "Indemnities", "Limitations",
+                  "Dispute Resolution", "Notices", "Change of Control"}
+    per_heading_cap = 2 if slot in fat_slots else 1
 
     # Pass 1: broad, metadata-aware
     rows = search_hybrid(
@@ -215,6 +233,7 @@ def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int =
         should_tokens=should or None,
         sparse_weight=0.6,
         should_weight=0.05,
+        per_heading_cap=per_heading_cap,
         **filters
     )
 
@@ -236,15 +255,20 @@ def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int =
                 filter_doc_id=prefer_doc,
                 neighbor_window=filters.get("neighbor_window"),
                 max_defs=filters.get("max_defs"),
+                per_heading_cap=per_heading_cap,
             )
 
+    # Prefer clause hits if present (neighbors/seq), else fall back to sections
+    preferred = [r for r in (rows + scoped) if r.get("src") == "C"] or (rows + scoped)
     # Combine & dedupe by (doc_id, section_id)
     seen = set()
     combined: List[Dict[str, Any]] = []
-    for r in (rows + scoped):
+    for r in preferred:
         key = (r.get("document_id"), r.get("section_id"))
-        if key in seen: continue
-        seen.add(key); combined.append(r)
+        if key in seen:
+            continue
+        seen.add(key)
+        combined.append(r)
 
     # Optionally merge near-adjacent hits within same doc
     stitched = _merge_adjacent(combined, cap_chars=merge_cap) if merge_adjacent else combined
@@ -256,7 +280,7 @@ def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int =
         srcs = r.get("sources") or [{"doc_id": r["document_id"], "section_id": r["section_id"], "title": r.get("title")}]
         sources.extend(srcs)
 
-    # Build a small “definitions table” seed for this slot
+    # Build a normalized definitions table seed for this slot
     defs = []
     for r in top_items:
         for d in (r.get("definitions") or []):
@@ -289,6 +313,73 @@ def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int =
     }
     return package
 
+
+def _normalize_def_table(defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract {term, content, doc_id, section_id} from raw definition snippets and de-dup."""
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    import re as _re
+    patt = _re.compile(r'"([^"]{2,80})"\s*(?:means|shall\s+mean)\s+(.+)', _re.IGNORECASE)
+    for d in defs:
+        text = d.get("content") or ""
+        m = patt.search(text)
+        term = None
+        if m:
+            term = m.group(1).strip()
+        # fallback to title for term
+        if not term:
+            title = (d.get("title") or "").strip()
+            if title and len(title) <= 80:
+                term = title
+        if not term:
+            continue
+        key = (term.lower(), d.get("doc_id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "term": term,
+            "content": text,
+            "doc_id": d.get("doc_id"),
+            "section_id": d.get("section_id"),
+        })
+    return out
+
+
+def _build_doc_ranking(spec: Dict[str, Any], slots: Dict[str, Any], primary: str, secondaries: List[str]) -> Dict[str, Any]:
+    """Produce explainable scores used for Primary/Secondary selection."""
+    required = set(spec.get("required", []))
+    # Collect per-slot best by doc
+    per_slot_scores: Dict[str, Dict[str, float]] = {}
+    docs = set()
+    for slot, pkg in slots.items():
+        scores: Dict[str, float] = {}
+        for r in pkg.get("items", []):
+            d = r.get("doc_id")
+            if not d:
+                continue
+            docs.add(d)
+            s = float(r.get("rrf") or 0.0)
+            if s > scores.get(d, 0.0):
+                scores[d] = s
+        per_slot_scores[slot] = scores
+    # Totals
+    totals: Dict[str, float] = {d: 0.0 for d in docs}
+    for slot, scores in per_slot_scores.items():
+        w = 2.0 if slot in required else 1.0
+        for d, s in scores.items():
+            totals[d] = totals.get(d, 0.0) + w * s
+    # Margins where a secondary beats primary
+    margins: Dict[str, float] = {}
+    for slot, scores in per_slot_scores.items():
+        p = scores.get(primary, 0.0)
+        best_sec = 0.0
+        for d in secondaries:
+            best_sec = max(best_sec, scores.get(d, 0.0))
+        margins[slot] = round(best_sec - p, 4)
+    return {"totals": totals, "per_slot": per_slot_scores, "margins_vs_primary": margins}
+
+
 def build_scp(spec: Dict[str, Any], include_optional: bool = True, top_k: int = 6, pool_n: int = 300) -> Dict[str, Any]:
     required = spec.get("required", [])
     optional = spec.get("optional", []) if include_optional else []
@@ -299,15 +390,38 @@ def build_scp(spec: Dict[str, Any], include_optional: bool = True, top_k: int = 
 
     # 2) Build a consolidated definitions table (term -> candidate snippets)
     # Note: You can add a real term extractor later; here we just carry the gathered defs.
-    def_table: List[Dict[str, Any]] = []
+    def_table_raw: List[Dict[str, Any]] = []
     for s in slots.values():
-        def_table.extend(s.get("definitions", []))
+        def_table_raw.extend(s.get("definitions", []))
+    def_table = _normalize_def_table(def_table_raw)
+
+    # 3) Stage-3: choose primary/secondaries and slot decisions
+    primary, secondaries, slot_decisions = _compute_primary_and_secondaries(spec, slots)
+    doc_ranking = _build_doc_ranking(spec, slots, primary, secondaries)
+
+    # 4) Retrieval params / runtime metadata
+    retrieval_params = {
+        "per_heading_cap_default": 1,
+        "fat_slots_per_heading_cap": {"R&W - Seller": 2, "R&W - Buyer": 2, "Indemnities": 2, "Limitations": 2},
+    }
+    retrieval_params.update({
+        "sparse_weight": 0.6,
+        "should_weight": 0.05,
+        "pool_n": pool_n,
+        "top_k": top_k,
+        "use_section_blobs": True,
+    })
 
     return {
         "spec": spec,
         "created_at": int(time.time()),
         "slots": slots,
         "definitions_table": def_table,
+        "primary_doc": primary,
+        "secondary_docs": secondaries,
+        "slot_decisions": slot_decisions,
+        "doc_ranking": doc_ranking,
+        "retrieval_params": retrieval_params,
         "notes": {
             "neighbor_window": 1,
             "max_defs": 6,
@@ -328,6 +442,107 @@ def _default_spec() -> Dict[str, Any]:
         "optional": ["Change of Control","Performance Guarantee","Tax Matters","Environmental","Insurance"],
         "constraints": {"arbitration_seat":"London","law":"NY"},
     }
+
+def _slot_best_by_doc(slot_pkg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Return best item per document for a slot (by rrf)."""
+    best: Dict[str, Dict[str, Any]] = {}
+    for r in slot_pkg.get("items", []):
+        doc = r.get("doc_id") or r.get("document_id")
+        if not doc:
+            continue
+        cur = best.get(doc)
+        if cur is None or (r.get("rrf") or 0.0) > (cur.get("rrf") or 0.0):
+            best[doc] = r
+    return best
+
+
+def _compute_primary_and_secondaries(spec: Dict[str, Any], slots: Dict[str, Any], max_secondaries: int = 2, improve_margin: float = 0.0) -> Tuple[str, List[str], Dict[str, Dict[str, Any]]]:
+    """Compute Primary doc, Secondary docs (greedy set-cover), and slot_decisions."""
+    required = set(spec.get("required", []))
+    optional = set(spec.get("optional", []))
+
+    # Gather candidate docs
+    docs = set()
+    slot_best: Dict[str, Dict[str, Any]] = {}
+    slot_best_by_doc: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for slot, pkg in slots.items():
+        best = _slot_best_by_doc(pkg)
+        slot_best_by_doc[slot] = best
+        for d in best.keys():
+            docs.add(d)
+    docs = list(docs)
+
+    # Per-doc score across slots
+    doc_total: Dict[str, float] = {d: 0.0 for d in docs}
+    for slot, best_map in slot_best_by_doc.items():
+        w = 2.0 if slot in required else 1.0
+        for d, item in best_map.items():
+            doc_total[d] += w * float(item.get("rrf") or 0.0)
+
+    if not doc_total:
+        return "", [], {}
+
+    primary = max(doc_total.items(), key=lambda x: x[1])[0]
+
+    # Greedy pick secondaries by number of required slots where they beat primary
+    secondaries: List[str] = []
+    remaining = [d for d in docs if d != primary]
+    while len(secondaries) < max_secondaries and remaining:
+        best_doc = None
+        best_gain = 0
+        for d in remaining:
+            gain = 0
+            for slot in required:
+                bm = slot_best_by_doc.get(slot, {})
+                d_rrf = float((bm.get(d) or {}).get("rrf") or 0.0)
+                p_rrf = float((bm.get(primary) or {}).get("rrf") or 0.0)
+                if d_rrf > p_rrf + improve_margin:
+                    gain += 1
+            if gain > best_gain:
+                best_gain = gain
+                best_doc = d
+        if best_doc is None or best_gain <= 0:
+            break
+        secondaries.append(best_doc)
+        remaining = [d for d in remaining if d != best_doc]
+
+    # Slot-level decisions: prefer primary unless a secondary beats by margin or primary missing
+    slot_decisions: Dict[str, Dict[str, Any]] = {}
+    override_margin = 0.03
+    pool = [primary] + secondaries
+    for slot, best_map in slot_best_by_doc.items():
+        choice_doc = primary
+        reason = None
+        p_item = best_map.get(primary)
+        p_rrf = float((p_item or {}).get("rrf") or 0.0)
+        best_sec = None
+        best_sec_rrf = p_rrf
+        for d in secondaries:
+            rrfd = float((best_map.get(d) or {}).get("rrf") or 0.0)
+            if rrfd > best_sec_rrf:
+                best_sec_rrf = rrfd
+                best_sec = d
+        if p_item is None and best_sec is not None:
+            choice_doc = best_sec
+            reason = f"primary missing; took secondary with rrf={best_sec_rrf:.3f}"
+        elif best_sec is not None and (best_sec_rrf - p_rrf) >= override_margin:
+            choice_doc = best_sec
+            reason = f"beats primary by Δrrf={best_sec_rrf - p_rrf:.2f}"
+        sel_item = best_map.get(choice_doc)
+        if sel_item:
+            slot_decisions[slot] = {
+                "doc": choice_doc,
+                "section_id": sel_item.get("section_id"),
+                "title": sel_item.get("title"),
+                "rrf": sel_item.get("rrf"),
+            }
+            if reason:
+                slot_decisions[slot]["reason"] = reason
+        else:
+            slot_decisions[slot] = {"doc": None, "section_id": None, "reason": "no candidates"}
+
+    return primary, secondaries, slot_decisions
+
 
 def main():
     ap = argparse.ArgumentParser(description="Build Section Context Protocol (SCP) from retriever")

@@ -10,6 +10,9 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
 	sys.path.insert(0, ROOT_DIR)
 
+# Force local embeddings for this CLI before importing retriever
+os.environ["USE_MODAL_EMBED"] = "0"
+
 from adapters.retrieval_adapter import search, ingest_data_dir, search_hybrid
 from adapters.retrieval_adapter import populate_clause_graph, retrieve_recursive
 
@@ -101,6 +104,7 @@ def main():
 	parser.add_argument("--merge-cap-chars", type=int, default=2000)
 	parser.add_argument("--json", action="store_true")
 	parser.add_argument("--explain", action="store_true")
+	parser.add_argument("--per-heading-cap", type=int, default=1, help="Max results per (document_id, heading_number)")
 	args = parser.parse_args()
 
 	if args.ingest:
@@ -152,6 +156,7 @@ def main():
 				neighbor_window=(args.neighbor_window if args.neighbor_window is not None else args.neighbors),
 				max_defs=args.max_defs,
 				explain=args.explain,
+				per_heading_cap=args.per_heading_cap,
 			)
 			# Scoped rerun within the top document
 			if args.scoped_rerun and results:
@@ -168,6 +173,7 @@ def main():
 						heading_like=args.heading_like,
 						neighbor_window=(args.neighbor_window if args.neighbor_window is not None else args.neighbors),
 						max_defs=args.max_defs,
+						per_heading_cap=args.per_heading_cap,
 					)
 					results = _dedupe_rows(results + scoped)
 		else:

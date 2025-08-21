@@ -17,7 +17,7 @@ except Exception as e:
 # Config / Environment
 # ---------------------------
 DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = int(os.getenv("DB_PORT", "5433"))  # <- default 5432 (Docker)
+DB_PORT = int(os.getenv("DB_PORT", "5433"))  # <- default 5433 (Docker)
 DB_NAME = os.getenv("DB_NAME", "infra_rag")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "changeme_local_pw")
@@ -72,6 +72,7 @@ _SCHEMA_READY = False
 _FTS_READY = False
 _VEC_READY = False
 _UNIQ_READY = False
+_SECT_READY = False
 
 
 # ---------------------------
@@ -90,7 +91,7 @@ def _get_model() -> SentenceTransformer:
 	if _MODEL is None:
 		if SentenceTransformer is None:
 			raise RuntimeError("sentence-transformers is required; please install it.")
-		_MODEL = SentenceTransformer(EMBED_MODEL_NAME)
+		_MODEL = SentenceTransformer(EMBED_MODEL_NAME, device='cpu')
 		try:
 			_EMBED_DIM = int(_MODEL.get_sentence_embedding_dimension())
 		except Exception:
@@ -102,18 +103,27 @@ def _embed_query(query: str) -> List[float]:
 	if USE_MODAL_EMBED:
 		from adapters.modal_embedding import embed_texts_remote
 		return embed_texts_remote([query])[0]
-	model = _get_model()
-	vec = model.encode([query], normalize_embeddings=True)[0]
-	return vec.tolist() if hasattr(vec, "tolist") else list(vec)
+	try:
+		model = _get_model()
+		vec = model.encode([query], normalize_embeddings=True)[0]
+		return vec.tolist() if hasattr(vec, "tolist") else list(vec)
+	except Exception:
+		# Fallback to remote embeddings if local model fails (e.g., HF rate limit or torch issue)
+		from adapters.modal_embedding import embed_texts_remote
+		return embed_texts_remote([query])[0]
 
 
 def _embed_texts(texts: List[str]) -> List[List[float]]:
 	if USE_MODAL_EMBED:
 		from adapters.modal_embedding import embed_texts_remote
 		return embed_texts_remote(texts)
-	model = _get_model()
-	arr = model.encode(texts, normalize_embeddings=True)
-	return arr.tolist() if hasattr(arr, "tolist") else [list(v) for v in arr]
+	try:
+		model = _get_model()
+		arr = model.encode(texts, normalize_embeddings=True)
+		return arr.tolist() if hasattr(arr, "tolist") else [list(v) for v in arr]
+	except Exception:
+		from adapters.modal_embedding import embed_texts_remote
+		return embed_texts_remote(texts)
 
 
 def _vector_to_sql_literal(vec: List[float]) -> str:
@@ -169,9 +179,6 @@ def _ensure_vector_index() -> None:
 		conn.commit()
 
 		# Adjust embedding dimension if we know it and table has rows/column exists
-		if _EMBED_DIM is None and not USE_MODAL_EMBED:
-			_get_model()  # sets _EMBED_DIM
-
 		if _column_exists(cur, "clauses", "embedding") and _EMBED_DIM:
 			# Fetch current dim; if mismatched, alter
 			cur.execute(
@@ -321,6 +328,135 @@ def _ensure_uniqueness_guard() -> None:
 # ---------------------------
 _QUOTE = re.compile(r'["]')
 
+# New token/constraint helpers for MUST/NOT/SHOULD
+from typing import Any as _Any  # alias to avoid confusion in helper signatures
+
+def _expand_token_variants(tok: str) -> List[str]:
+	"""Produce simple ILIKE-friendly variants for hyphens/spaces and a few domain terms."""
+	t = (tok or "").strip()
+	if not t:
+		return []
+	v: set[str] = {t}
+	# normalize hyphens/spaces
+	hy = t.replace("–", "-").replace("—", "-")
+	sp = hy.replace("-", " ")
+	hy2 = sp.replace(" ", "-")
+	v.update({hy, sp, hy2, t.lower(), sp.lower(), hy2.lower()})
+	# domain tweaks
+	tl = t.lower()
+	if tl == "pre-award":
+		v.update(["pre award", "preaward"])
+	if tl == "arbitral award":
+		v.add("arbitration award")
+	if tl in {"360 day", "360-day", "360 days", "360-day basis"}:
+		v.update(["360 day", "360-day", "360 day basis", "360-day basis", "360 day year", "360-day year"])
+	# de-dup preserving first occurrence (case-insensitive)
+	out: List[str] = []
+	seen: set[str] = set()
+	for x in v:
+		xl = x.lower()
+		if xl in seen:
+			continue
+		seen.add(xl)
+		out.append(x)
+	return out
+
+
+def _build_must_sql(alias: str, tokens: Optional[List[str]], params: List[_Any]) -> str:
+	"""Build AND-of( OR-of(ILIKE variants) ) predicate for must tokens; appends params."""
+	toks = tokens or []
+	groups: List[str] = []
+	for tok in toks:
+		vars_ = _expand_token_variants(tok)
+		if not vars_:
+			continue
+		ors: List[str] = []
+		for v in vars_:
+			ors.append(f"{alias}.content ILIKE %s")
+			params.append(f"%{v}%")
+		groups.append("(" + " OR ".join(ors) + ")")
+	return "TRUE" if not groups else "(" + " AND ".join(groups) + ")"
+
+
+def _build_must_not_sql(alias: str, tokens: Optional[List[str]], params: List[_Any]) -> str:
+	"""Build NOT( OR-of(ILIKE variants) ) predicate for must_not tokens; appends params."""
+	toks = tokens or []
+	ors: List[str] = []
+	for tok in toks:
+		for v in _expand_token_variants(tok):
+			ors.append(f"{alias}.content ILIKE %s")
+			params.append(f"%{v}%")
+	return "TRUE" if not ors else "(NOT (" + " OR ".join(ors) + "))"
+
+
+def _expand_should_patterns(tokens: Optional[List[str]]) -> List[str]:
+	"""Expand should tokens; include hyphen/space variants and a light LIBOR→SOFR nudge."""
+	toks = tokens or []
+	out: List[str] = []
+	for t in toks:
+		out.extend(_expand_token_variants(t))
+		if t.strip().lower() == "libor":
+			out.extend(["SOFR"])  # optional modern synonym
+	# de-dup case-insensitively, keep first occurrence
+	seen: set[str] = set(); res: List[str] = []
+	for x in out:
+		xl = x.lower()
+		if xl in seen:
+			continue
+		seen.add(xl); res.append(x)
+	return res
+
+
+def _build_should_score_sql(alias: str, patterns: List[str], params: List[_Any]) -> str:
+	"""Returns expression averaging CASE(ILIKE) over should patterns; appends params."""
+	if not patterns:
+		return "0.0"
+	terms: List[str] = []
+	for p in patterns:
+		params.append(f"%{p}%")
+		terms.append(f"CASE WHEN {alias}.content ILIKE %s THEN 1.0 ELSE 0.0 END")
+	return "(" + " + ".join(terms) + f") / {len(patterns)}"
+
+
+# Column-aware variants for MUST/NOT/SHOULD on arbitrary text columns
+def _build_must_sql_on(alias: str, column: str, tokens: Optional[List[str]], params: List[_Any]) -> str:
+	"""AND-of(OR-of(ILIKE variants)) on alias.column; appends params in order."""
+	toks = tokens or []
+	groups: List[str] = []
+	for tok in toks:
+		vars_ = _expand_token_variants(tok)
+		if not vars_:
+			continue
+		ors: List[str] = []
+		for v in vars_:
+			ors.append(f"{alias}.{column} ILIKE %s")
+			params.append(f"%{v}%")
+		groups.append("(" + " OR ".join(ors) + ")")
+	return "TRUE" if not groups else "(" + " AND ".join(groups) + ")"
+
+
+def _build_must_not_sql_on(alias: str, column: str, tokens: Optional[List[str]], params: List[_Any]) -> str:
+	"""NOT(OR-of(ILIKE variants)) on alias.column; appends params."""
+	toks = tokens or []
+	ors: List[str] = []
+	for tok in toks:
+		for v in _expand_token_variants(tok):
+			ors.append(f"{alias}.{column} ILIKE %s")
+			params.append(f"%{v}%")
+	return "TRUE" if not ors else "(NOT (" + " OR ".join(ors) + "))"
+
+
+def _build_should_score_sql_on(alias: str, column: str, patterns: List[str], params: List[_Any]) -> str:
+	"""AVG(CASE ILIKE) score over patterns on alias.column; appends params."""
+	if not patterns:
+		return "0.0"
+	terms: List[str] = []
+	for p in patterns:
+		params.append(f"%{p}%")
+		terms.append(f"CASE WHEN {alias}.{column} ILIKE %s THEN 1.0 ELSE 0.0 END")
+	return "(" + " + ".join(terms) + f") / {len(patterns)}"
+
+
 def _expand_for_fts(query: str) -> str:
 	"""Add domain synonyms for sparse side using websearch syntax (OR)."""
 	ql = query.lower()
@@ -351,6 +487,20 @@ def _ensure_perf_indexes() -> None:
 		cur.execute("CREATE INDEX IF NOT EXISTS documents_law_idx      ON documents(governing_law)")
 		cur.execute("CREATE INDEX IF NOT EXISTS documents_industry_idx ON documents(industry)")
 		cur.execute("CREATE INDEX IF NOT EXISTS documents_type_idx     ON documents(document_type)")
+		# Section blobs existence gate (indexes created in section schema ensure)
+		cur.execute(
+			"""
+			DO $$
+			BEGIN
+			  IF EXISTS (
+				SELECT 1 FROM information_schema.tables
+				WHERE table_name='section_blobs'
+			  ) THEN
+				PERFORM 1;
+			  END IF;
+			END$$;
+			"""
+		)
 		conn.commit()
 
 
@@ -438,29 +588,44 @@ def _attach_neighbors_and_defs(rows: List[Dict[str, Any]], neighbor_window: Opti
 					caps = re.findall(r"\b([A-Z][A-Za-z0-9\-]{2,})\b", text)
 					if caps:
 						terms_by_doc.setdefault(r["document_id"], []).extend(caps)
+			# Ensure every doc in the result set is processed (enables pure fallback)
+			docs_in_rows = {r["document_id"] for r in rows if r.get("document_id")}
+			for d in docs_in_rows:
+				terms_by_doc.setdefault(d, [])
 			# de-dupe and cap
 			for d in list(terms_by_doc):
 				dedup = list(dict.fromkeys(t.strip() for t in terms_by_doc[d] if t.strip()))
 				terms_by_doc[d] = dedup[:def_cap]
-			# fetch matching Definitions once per doc and attach
+			# fetch matching Definitions once per doc and attach; if none, fall back to leading Definitions
 			for doc_id, terms in terms_by_doc.items():
-				if not terms:
-					continue
-				like_list = ["%" + t + "%" for t in terms]
-				cur.execute(
-					"""
-					SELECT section_id, title, content
-					FROM clauses
-					WHERE document_id=%s
-					  AND clause_type='Definitions'
-					  AND (content ILIKE ANY(%s)
-					       OR EXISTS (
-					          SELECT 1 FROM unnest(defined_terms) t WHERE t = ANY(%s)
-					       ))
-					""",
-					(doc_id, like_list, terms),
-				)
-				defs = [dict(x) for x in cur.fetchall()]
+				defs: List[Dict[str, Any]] = []
+				if terms:
+					like_list = ["%" + t + "%" for t in terms]
+					cur.execute(
+						"""
+						SELECT section_id, title, content
+						FROM clauses
+						WHERE document_id=%s
+						  AND clause_type='Definitions'
+						  AND (content ILIKE ANY(%s)
+						       OR EXISTS (SELECT 1 FROM unnest(defined_terms) t WHERE t = ANY(%s)))
+						""",
+						(doc_id, like_list, terms),
+					)
+					defs = [dict(x) for x in cur.fetchall()]
+				if not defs:
+					cur.execute(
+						"""
+						SELECT section_id, title, content
+						FROM clauses
+						WHERE document_id=%s
+						  AND clause_type='Definitions'
+						ORDER BY COALESCE(seq, 1<<30) ASC
+						LIMIT %s
+						""",
+						(doc_id, def_cap),
+					)
+					defs = [dict(x) for x in cur.fetchall()]
 				for r in rows:
 					if r["document_id"] == doc_id:
 						r["definitions"] = defs[:def_cap]
@@ -468,55 +633,112 @@ def _attach_neighbors_and_defs(rows: List[Dict[str, Any]], neighbor_window: Opti
 
 
 # ---------------------------
-# Dense-only search (cosine)
+# Section blobs schema/build
 # ---------------------------
-def _search_dense(query_vec: List[float], limit: int = 15) -> List[Dict[str, Any]]:
-	qvec = _vector_to_sql_literal(query_vec)
-	with _connect() as conn, conn.cursor(row_factory=dict_row) as cur:
-		cur.execute(f"SET LOCAL ivfflat.probes = {int(IVFFLAT_PROBES)}")
+def _ensure_section_blobs_schema() -> None:
+	"""Create a real table (not MV) for aggregated sections + embeddings."""
+	global _SECT_READY, _EMBED_DIM
+	if _SECT_READY:
+		return
+	with _connect() as conn, conn.cursor() as cur:
+		# table
 		cur.execute(
 			"""
-			SELECT id, document_id, section_id, title, content,
-				   (1.0 - (embedding <-> %s::vector)) AS cos_sim
-			FROM clauses
-			WHERE embedding IS NOT NULL
-			ORDER BY embedding <-> %s::vector
-			LIMIT %s
-			""",
-			(qvec, qvec, limit),
+			CREATE TABLE IF NOT EXISTS section_blobs (
+			  id BIGSERIAL PRIMARY KEY,
+			  document_id text NOT NULL,
+			  heading_number text NOT NULL,
+			  title text,
+			  section_text text,
+			  embedding vector
+			)
+			"""
+		)
+		# heading filter / lookup
+		cur.execute("CREATE INDEX IF NOT EXISTS section_blobs_doc_head_idx ON section_blobs(document_id, heading_number)")
+		cur.execute("CREATE INDEX IF NOT EXISTS section_blobs_head_like_idx ON section_blobs (heading_number text_pattern_ops)")
+		# FTS (expression index). Must match query expression exactly.
+		cur.execute("CREATE INDEX IF NOT EXISTS section_blobs_fts_idx ON section_blobs USING gin (to_tsvector('english', section_text))")
+		# Vector extension + index with cosine
+		cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+		# Avoid type ALTER during parallel searches; assume set by maintenance/rebuild
+		# Cosine IVFFLAT index (idempotent create)
+		cur.execute(
+			f"""
+			DO $$
+			BEGIN
+			  IF NOT EXISTS (
+				SELECT 1 FROM pg_indexes
+				WHERE schemaname='public' AND indexname='idx_section_blobs_embedding_cosine_ivfflat'
+			  ) THEN
+				EXECUTE 'CREATE INDEX idx_section_blobs_embedding_cosine_ivfflat
+					 ON section_blobs USING ivfflat (embedding vector_cosine_ops) WITH (lists = {IVFFLAT_LISTS})';
+			  END IF;
+			END$$;
+			"""
+		)
+		conn.commit()
+	_SECT_READY = True
+
+
+def _rebuild_section_blobs(reembed: bool = True, batch: int = 64) -> None:
+	"""Rebuild the section table by aggregating clauses. Safe to run repeatedly."""
+	_ensure_section_blobs_schema()
+	texts: List[Tuple[str, str, Optional[str], str]] = []
+	with _connect() as conn, conn.cursor() as cur:
+		# Aggregate from clauses
+		cur.execute(
+			"""
+			WITH agg AS (
+			  SELECT
+				document_id,
+				heading_number,
+				MIN(title) AS title,
+				string_agg(content, E'\n\n' ORDER BY seq) AS section_text
+			  FROM clauses
+			  WHERE heading_number IS NOT NULL
+			  GROUP BY document_id, heading_number
+			)
+			SELECT document_id, heading_number, title, section_text
+			FROM agg
+			"""
 		)
 		rows = cur.fetchall()
-	# De-dupe by (document_id, section_id)
-	seen = set()
-	out = []
-	for r in rows:
-		key = (r["document_id"], r["section_id"])
-		if key in seen:
-			continue
-		seen.add(key)
-		out.append(
-			{
-				"id": r["id"],
-				"document_id": r["document_id"],
-				"section_id": r["section_id"],
-				"title": r["title"],
-				"content": r["content"],
-				"cos_sim": float(r["cos_sim"]) if r["cos_sim"] is not None else None,
-			}
-		)
-	return out
+		# Start fresh
+		cur.execute("TRUNCATE section_blobs")
+		conn.commit()
+		for r in rows:
+			texts.append((r[0], r[1], r[2], r[3]))
+
+		# Insert in batches, with embeddings
+		for i in range(0, len(texts), batch):
+			chunk = texts[i:i+batch]
+			section_texts = [t[3] or "" for t in chunk]
+			embs: List[List[float]] = [[] for _ in chunk]
+			if reembed:
+				embs = _embed_texts(section_texts)
+			# Prepare literals
+			emb_lits = [(_vector_to_sql_literal(e) if e else None) for e in embs]
+			args = []
+			for (doc, head, title, text), el in zip(chunk, emb_lits):
+				args.append((doc, head, title, text, el))
+			with conn.cursor() as cur2:
+				cur2.executemany(
+					"INSERT INTO section_blobs (document_id, heading_number, title, section_text, embedding) "
+					"VALUES (%s, %s, %s, %s, %s::vector)",
+					args
+				)
+			conn.commit()
 
 
-def search(query: str, top_k: int = 15) -> List[Dict[str, Any]]:
-	"""Dense-only (cosine) search."""
-	_ensure_schema()
-	_ensure_vector_index()
-	_ensure_fts()
-	_ensure_uniqueness_guard()
-	_ensure_perf_indexes()
-	qvec = _embed_query(query)
-	rows = _search_dense(qvec, limit=top_k)
-	return _attach_neighbors_and_defs(rows)
+def _ensure_section_blobs_ready() -> None:
+	"""One-time bootstrap: if table empty, build it."""
+	_ensure_section_blobs_schema()
+	with _connect() as conn, conn.cursor() as cur:
+		cur.execute("SELECT COUNT(*) FROM section_blobs")
+		n = cur.fetchone()[0]
+	if int(n) == 0:
+		_rebuild_section_blobs(reembed=True)
 
 
 # ---------------------------
@@ -545,61 +767,50 @@ def search_hybrid(
 	neighbor_window: Optional[int] = None,
 	max_defs: Optional[int] = None,
 	explain: bool = False,
+	per_heading_cap: int = 1,
 ) -> List[Dict[str, Any]]:
-	"""Cosine ANN + weighted FTS, fused by RRF. Returns rows with rrf score + context.
-	Optionally require must_tokens (all must appear via ILIKE) to prefilter candidates.
-	Supports must_not and should tokens, optional metadata filters and boosts, and heading/doc filters.
-	"""
+	"""Cosine ANN + weighted FTS for both clauses and section_blobs, with proper MUST/NOT for both."""
 	_ensure_schema()
 	_ensure_vector_index()
 	_ensure_fts()
 	_ensure_uniqueness_guard()
 	_ensure_perf_indexes()
+	_ensure_section_blobs_ready()
 
 	qvec = _embed_query(query)
 	qvec_lit = _vector_to_sql_literal(qvec)
 	q_fts = _expand_for_fts(query) if expand_sparse else query
 	probes = probes or IVFFLAT_PROBES
 	rrf_k = rrf_k or RRF_K
-	must = must_tokens or []
-	must_not = must_not_tokens or []
-	should = should_tokens or []
-	patterns = [f"%{t}%" for t in must]
-	patterns_not = [f"%{t}%" for t in must_not]
-	patterns_should = [f"%{t}%" for t in should]
-	# derive a content fallback for law if metadata is missing
+
+	# Build dynamic MUST / MUST_NOT SQL & params
+	dyn_params: List[Any] = []
+	must_sql_c = _build_must_sql_on("c", "content", must_tokens, dyn_params)
+	mustnot_sql_c = _build_must_not_sql_on("c", "content", must_not_tokens, dyn_params)
+	must_sql_s = _build_must_sql_on("sb", "section_text", must_tokens, dyn_params)
+	mustnot_sql_s = _build_must_not_sql_on("sb", "section_text", must_not_tokens, dyn_params)
+
+	should_patterns = _expand_should_patterns(should_tokens)
+	should_params: List[Any] = []
+	should_score_c = _build_should_score_sql_on("c", "content", should_patterns, should_params)
+	should_score_s = _build_should_score_sql_on("sb", "section_text", should_patterns, should_params)
+
+	# law LIKE fallback
 	law_like = None
 	if filter_law:
 		_l = filter_law.strip().lower()
-		law_map = {
-			"ny": "%New York%",
-			"us-ny": "%New York%",
-			"new york": "%New York%",
-			"de": "%Delaware%",
-			"us-de": "%Delaware%",
-			"delaware": "%Delaware%",
-			"ca": "%California%",
-			"us-ca": "%California%",
-			"california": "%California%",
-		}
+		law_map = {"ny": "%New York%", "new york": "%New York%", "us-ny": "%New York%", "de": "%Delaware%", "delaware": "%Delaware%", "us-de": "%Delaware%", "ca": "%California%", "california": "%California%", "us-ca": "%California%"}
 		law_like = law_map.get(_l)
- 
+
 	with _connect() as conn, conn.cursor(row_factory=dict_row) as cur:
 		cur.execute(f"SET LOCAL ivfflat.probes = {int(probes)}")
-		cur.execute(
-			"""
+		sql = f"""
 			WITH params AS (
 			  SELECT %s::vector AS qvec,
 					 websearch_to_tsquery('english', %s) AS q,
 					 plainto_tsquery('simple', %s) AS q_simple,
 					 %s::int AS pool_n,
 					 %s::int AS k,
-					 %s::int AS must_n,
-					 %s::text[] AS must_patterns,
-					 %s::int AS must_not_n,
-					 %s::text[] AS must_not_patterns,
-					 %s::int AS should_n,
-					 %s::text[] AS should_patterns,
 					 %s::float AS sparse_w,
 					 %s::float AS should_w,
 					 %s::text AS heading_like,
@@ -612,146 +823,225 @@ def search_hybrid(
 					 %s::text AS filter_doc_id,
 					 %s::boolean AS enforce_constraints
 			),
-			dense AS (
+
+			/* CLAUSES */
+			dense_clauses AS (
 			  SELECT c.id,
 					 row_number() OVER (ORDER BY c.embedding <-> (SELECT qvec FROM params)) AS r_dense
 			  FROM clauses c
 			  JOIN documents d ON d.document_id = c.document_id
 			  WHERE c.embedding IS NOT NULL
-			    AND ( (SELECT heading_like FROM params) IS NULL
-			          OR c.heading_number LIKE (SELECT heading_like FROM params)
-			          OR c.clause_number  LIKE (SELECT heading_like FROM params) )
-			    AND ( (SELECT filter_doc_id FROM params) IS NULL OR c.document_id = (SELECT filter_doc_id FROM params) )
-			    AND (
-			      (SELECT must_n FROM params)=0 OR (
-			        SELECT bool_and(c.content ILIKE p)
-			        FROM unnest((SELECT must_patterns FROM params)) AS p
-			      )
-			    )
-			    AND (
-			      (SELECT must_not_n FROM params)=0 OR NOT (
-			        SELECT bool_or(c.content ILIKE p)
-			        FROM unnest((SELECT must_not_patterns FROM params)) AS p
-			      )
-			    )
-			    AND (
-			      (SELECT enforce_constraints FROM params) = FALSE OR (
-			        ((SELECT law FROM params) IS NULL OR d.governing_law = (SELECT law FROM params)
-			         OR (d.governing_law IS NULL AND (SELECT law_like FROM params) IS NOT NULL AND c.content ILIKE (SELECT law_like FROM params))) AND
-			        ((SELECT industry FROM params) IS NULL OR d.industry = (SELECT industry FROM params)) AND
-			        ((SELECT doc_type FROM params) IS NULL OR d.document_type = (SELECT doc_type FROM params))
-			      )
-			    )
+				AND ((SELECT heading_like FROM params) IS NULL
+					 OR c.heading_number LIKE (SELECT heading_like FROM params)
+					 OR c.clause_number  LIKE (SELECT heading_like FROM params))
+				AND ((SELECT filter_doc_id FROM params) IS NULL OR c.document_id = (SELECT filter_doc_id FROM params))
+				AND {must_sql_c}
+				AND {mustnot_sql_c}
+				AND (
+				  (SELECT enforce_constraints FROM params) = FALSE OR (
+					((SELECT law FROM params) IS NULL OR d.governing_law = (SELECT law FROM params)
+					 OR (d.governing_law IS NULL AND (SELECT law_like FROM params) IS NOT NULL AND c.content ILIKE (SELECT law_like FROM params)))
+					AND ((SELECT industry FROM params) IS NULL OR d.industry = (SELECT industry FROM params))
+					AND ((SELECT doc_type FROM params) IS NULL OR d.document_type = (SELECT doc_type FROM params))
+				  )
+				)
 			  ORDER BY c.embedding <-> (SELECT qvec FROM params)
 			  LIMIT (SELECT pool_n FROM params)
 			),
-			sparse AS (
+			sparse_clauses AS (
 			  SELECT c.id,
 					 row_number() OVER (
-					   ORDER BY (
-					     ts_rank_cd(c.fts, (SELECT q FROM params), 32)
-					     + 0.2 * ts_rank_cd(c.fts_simple, (SELECT q_simple FROM params))
-					   ) DESC
+					   ORDER BY ( ts_rank_cd(c.fts, (SELECT q FROM params), 32)
+								+ 0.2 * ts_rank_cd(c.fts_simple, (SELECT q_simple FROM params)) ) DESC
 					 ) AS r_sparse
 			  FROM clauses c
 			  JOIN documents d ON d.document_id = c.document_id
 			  WHERE c.fts @@ (SELECT q FROM params)
-			    AND ( (SELECT heading_like FROM params) IS NULL
-			          OR c.heading_number LIKE (SELECT heading_like FROM params)
-			          OR c.clause_number  LIKE (SELECT heading_like FROM params) )
-			    AND ( (SELECT filter_doc_id FROM params) IS NULL OR c.document_id = (SELECT filter_doc_id FROM params) )
-			    AND (
-			      (SELECT must_n FROM params)=0 OR (
-			        SELECT bool_and(c.content ILIKE p)
-			        FROM unnest((SELECT must_patterns FROM params)) AS p
-			      )
-			    )
-			    AND (
-			      (SELECT must_not_n FROM params)=0 OR NOT (
-			        SELECT bool_or(c.content ILIKE p)
-			        FROM unnest((SELECT must_not_patterns FROM params)) AS p
-			      )
-			    )
-			    AND (
-			      (SELECT enforce_constraints FROM params) = FALSE OR (
-			        ((SELECT law FROM params) IS NULL OR d.governing_law = (SELECT law FROM params)
-			         OR (d.governing_law IS NULL AND (SELECT law_like FROM params) IS NOT NULL AND c.content ILIKE (SELECT law_like FROM params))) AND
-			        ((SELECT industry FROM params) IS NULL OR d.industry = (SELECT industry FROM params)) AND
-			        ((SELECT doc_type FROM params) IS NULL OR d.document_type = (SELECT doc_type FROM params))
-			      )
-			    )
-			  ORDER BY (
-					 ts_rank_cd(c.fts, (SELECT q FROM params), 32)
-					 + 0.2 * ts_rank_cd(c.fts_simple, (SELECT q_simple FROM params))
-				) DESC
+				AND ((SELECT heading_like FROM params) IS NULL
+					 OR c.heading_number LIKE (SELECT heading_like FROM params)
+					 OR c.clause_number  LIKE (SELECT heading_like FROM params))
+				AND ((SELECT filter_doc_id FROM params) IS NULL OR c.document_id = (SELECT filter_doc_id FROM params))
+				AND {must_sql_c}
+				AND {mustnot_sql_c}
+				AND (
+				  (SELECT enforce_constraints FROM params) = FALSE OR (
+					((SELECT law FROM params) IS NULL OR d.governing_law = (SELECT law FROM params)
+					 OR (d.governing_law IS NULL AND (SELECT law_like FROM params) IS NOT NULL AND c.content ILIKE (SELECT law_like FROM params)))
+					AND ((SELECT industry FROM params) IS NULL OR d.industry = (SELECT industry FROM params))
+					AND ((SELECT doc_type FROM params) IS NULL OR d.document_type = (SELECT doc_type FROM params))
+				  )
+				)
+			  ORDER BY ( ts_rank_cd(c.fts, (SELECT q FROM params), 32)
+					   + 0.2 * ts_rank_cd(c.fts_simple, (SELECT q_simple FROM params)) ) DESC
 			  LIMIT (SELECT pool_n FROM params)
 			),
-			unioned AS (
-			  SELECT id, r_dense, NULL::int AS r_sparse FROM dense
-			  UNION ALL
-			  SELECT id, NULL::int, r_sparse FROM sparse
-			),
-			agg AS (
+			union_clauses AS (
 			  SELECT id, MIN(r_dense) AS r_dense, MIN(r_sparse) AS r_sparse
-			  FROM unioned GROUP BY id
+			  FROM (
+				SELECT id, r_dense, NULL::int AS r_sparse FROM dense_clauses
+				UNION ALL
+				SELECT id, NULL::int, r_sparse FROM sparse_clauses
+			  ) u
+			  GROUP BY id
 			),
-			fused AS (
-			  SELECT a.id,
-					 (SELECT sparse_w FROM params) * COALESCE(1.0/((SELECT k FROM params) + a.r_sparse), 0.0)
-				   + (1.0 - (SELECT sparse_w FROM params)) * COALESCE(1.0/((SELECT k FROM params) + a.r_dense), 0.0)
-				   + (SELECT should_w FROM params) * (
-						SELECT COALESCE(AVG(CASE WHEN c.content ILIKE p THEN 1.0 ELSE 0.0 END),0.0)
-						FROM unnest((SELECT should_patterns FROM params)) AS p, clauses c
-						WHERE c.id = a.id
-					 )
+			fused_clauses AS (
+			  SELECT c.id,
+					 c.document_id, c.section_id, c.title, c.content,
+					 (SELECT sparse_w FROM params) * COALESCE(1.0/((SELECT k FROM params) + uc.r_sparse), 0.0)
+				   + (1.0 - (SELECT sparse_w FROM params)) * COALESCE(1.0/((SELECT k FROM params) + uc.r_dense), 0.0)
+				   + (SELECT should_w FROM params) * ({should_score_c})
 				   + 0.10 * CASE WHEN (SELECT law FROM params) IS NOT NULL AND d.governing_law = (SELECT law FROM params) THEN 1 ELSE 0 END
 				   + 0.10 * CASE WHEN (SELECT doc_type FROM params) IS NOT NULL AND d.document_type = (SELECT doc_type FROM params) THEN 1 ELSE 0 END
 				   + 0.10 * CASE WHEN (SELECT industry FROM params) IS NOT NULL AND d.industry = (SELECT industry FROM params) THEN 1 ELSE 0 END
 				   + 0.15 * CASE WHEN (SELECT prefer_doc FROM params) IS NOT NULL AND c.document_id = (SELECT prefer_doc FROM params) THEN 1 ELSE 0 END AS rrf,
-				 a.r_dense, a.r_sparse
-			  FROM agg a
-			  JOIN clauses c ON c.id=a.id
+				 uc.r_dense, uc.r_sparse,
+				 c.heading_number, c.seq, c.clause_type, c.defined_terms,
+				 d.document_type, d.governing_law, d.industry,
+				 'C'::text AS src
+			  FROM union_clauses uc
+			  JOIN clauses c ON c.id = uc.id
 			  JOIN documents d ON d.document_id = c.document_id
-			)
-			SELECT c.id, c.document_id, c.section_id, c.title, c.content, f.rrf, f.r_dense, f.r_sparse,
-			       c.heading_number, c.seq, c.clause_type, c.defined_terms,
-			       d.document_type, d.governing_law, d.industry
-			FROM fused f
-			JOIN clauses c ON c.id=f.id
-			JOIN documents d ON d.document_id = c.document_id
-			ORDER BY f.rrf DESC
-			LIMIT %s
-			""",
-			(
-				qvec_lit, q_fts, query, pool_n, rrf_k,
-				len(must), patterns,
-				len(must_not), patterns_not,
-				len(should), patterns_should,
-				float(sparse_weight), float(should_weight),
-				heading_like,
-				filter_law,
-				law_like,
-				filter_industry,
-				filter_doc_type,
-				filter_seat,
-				prefer_doc,
-				filter_doc_id,
-				bool(enforce_constraints),
-				top_k,
 			),
-		)
+
+			/* SECTIONS */
+			dense_sections AS (
+			  SELECT sb.id,
+					 row_number() OVER (ORDER BY sb.embedding <-> (SELECT qvec FROM params)) AS r_dense
+			  FROM section_blobs sb
+			  JOIN documents d ON d.document_id = sb.document_id
+			  WHERE sb.embedding IS NOT NULL
+				AND ((SELECT heading_like FROM params) IS NULL
+					 OR sb.heading_number LIKE (SELECT heading_like FROM params))
+				AND ((SELECT filter_doc_id FROM params) IS NULL OR sb.document_id = (SELECT filter_doc_id FROM params))
+				AND {must_sql_s}
+				AND {mustnot_sql_s}
+				AND (
+				  (SELECT enforce_constraints FROM params) = FALSE OR (
+					((SELECT law FROM params) IS NULL OR d.governing_law = (SELECT law FROM params))
+					AND ((SELECT industry FROM params) IS NULL OR d.industry = (SELECT industry FROM params))
+					AND ((SELECT doc_type FROM params) IS NULL OR d.document_type = (SELECT doc_type FROM params))
+				  )
+				)
+			  ORDER BY sb.embedding <-> (SELECT qvec FROM params)
+			  LIMIT (SELECT pool_n FROM params)
+			),
+			sparse_sections AS (
+			  SELECT sb.id,
+					 row_number() OVER (
+					   ORDER BY ts_rank_cd(to_tsvector('english', sb.section_text), (SELECT q FROM params), 32) DESC
+					 ) AS r_sparse
+			  FROM section_blobs sb
+			  JOIN documents d ON d.document_id = sb.document_id
+			  WHERE to_tsvector('english', sb.section_text) @@ (SELECT q FROM params)
+				AND ((SELECT heading_like FROM params) IS NULL
+					 OR sb.heading_number LIKE (SELECT heading_like FROM params))
+				AND ((SELECT filter_doc_id FROM params) IS NULL OR sb.document_id = (SELECT filter_doc_id FROM params))
+				AND {must_sql_s}
+				AND {mustnot_sql_s}
+				AND (
+				  (SELECT enforce_constraints FROM params) = FALSE OR (
+					((SELECT law FROM params) IS NULL OR d.governing_law = (SELECT law FROM params))
+					AND ((SELECT industry FROM params) IS NULL OR d.industry = (SELECT industry FROM params))
+					AND ((SELECT doc_type FROM params) IS NULL OR d.document_type = (SELECT doc_type FROM params))
+				  )
+				)
+			  ORDER BY ts_rank_cd(to_tsvector('english', sb.section_text), (SELECT q FROM params), 32) DESC
+			  LIMIT (SELECT pool_n FROM params)
+			),
+			union_sections AS (
+			  SELECT id, MIN(r_dense) AS r_dense, MIN(r_sparse) AS r_sparse
+			  FROM (
+				SELECT id, r_dense, NULL::int AS r_sparse FROM dense_sections
+				UNION ALL
+				SELECT id, NULL::int, r_sparse FROM sparse_sections
+			  ) u
+			  GROUP BY id
+			),
+			fused_sections AS (
+			  SELECT sb.id,
+					 sb.document_id,
+					 ('H:' || sb.heading_number) as section_id,
+					 sb.title,
+					 sb.section_text AS content,
+					 (SELECT sparse_w FROM params) * COALESCE(1.0/((SELECT k FROM params) + us.r_sparse), 0.0)
+				   + (1.0 - (SELECT sparse_w FROM params)) * COALESCE(1.0/((SELECT k FROM params) + us.r_dense), 0.0)
+				   + (SELECT should_w FROM params) * ({should_score_s})
+				   + 0.02 AS rrf,
+				 us.r_dense, us.r_sparse,
+				 sb.heading_number,
+				 NULL::int AS seq,
+				 NULL::text AS clause_type,
+				 NULL::text[] AS defined_terms,
+				 d.document_type, d.governing_law, d.industry,
+				 'S'::text AS src
+			  FROM union_sections us
+			  JOIN section_blobs sb ON sb.id = us.id
+			  JOIN documents d ON d.document_id = sb.document_id
+			),
+
+			fused_all AS (
+			  SELECT * FROM fused_clauses
+			  UNION ALL
+			  SELECT * FROM fused_sections
+			),
+			ranked AS (
+			  SELECT *,
+					 ROW_NUMBER() OVER (
+					   PARTITION BY document_id, heading_number
+					   ORDER BY rrf DESC
+					 ) AS rn
+			  FROM fused_all
+			)
+			SELECT id, document_id, section_id, title, content, rrf, r_dense, r_sparse,
+			       heading_number, seq, clause_type, defined_terms,
+			       document_type, governing_law, industry, src
+			FROM ranked
+			WHERE rn <= %s
+			ORDER BY rrf DESC
+			LIMIT %s
+		"""
+
+		# Assemble parameters in exact order
+		base_params = [
+			qvec_lit, q_fts, query, pool_n, rrf_k,
+			float(sparse_weight), float(should_weight),
+			heading_like, filter_law, law_like, filter_industry, filter_doc_type,
+			filter_seat, prefer_doc, filter_doc_id, bool(enforce_constraints),
+		]
+		# Build dynamic param list deterministically, matching placeholder order:
+		def expand_list(tokens: Optional[List[str]]) -> List[str]:
+			return [f"%{v}%" for tok in (tokens or []) for v in _expand_token_variants(tok)]
+		dyn_ordered: List[Any] = []
+		# clauses dense (must + not)
+		dyn_ordered += expand_list(must_tokens)
+		dyn_ordered += expand_list(must_not_tokens)
+		# clauses sparse (must + not)
+		dyn_ordered += expand_list(must_tokens)
+		dyn_ordered += expand_list(must_not_tokens)
+		# sections dense (must + not)
+		dyn_ordered += expand_list(must_tokens)
+		dyn_ordered += expand_list(must_not_tokens)
+		# sections sparse (must + not)
+		dyn_ordered += expand_list(must_tokens)
+		dyn_ordered += expand_list(must_not_tokens)
+		# should score (clauses)
+		dyn_ordered += [f"%{p}%" for p in should_patterns]
+		# should score (sections)
+		dyn_ordered += [f"%{p}%" for p in should_patterns]
+
+		all_params = base_params + dyn_ordered + [int(per_heading_cap), top_k]
+		cur.execute(sql, all_params)
 		rows = cur.fetchall()
 
-	# De-dupe by (document_id, section_id)
-	seen = set()
-	uniq: List[Dict[str, Any]] = []
+	# De-dupe & attach neighbors/defs for clause rows (sections left as-is)
+	seen = set(); clause_rows: List[Dict[str, Any]] = []; section_rows: List[Dict[str, Any]] = []
 	for r in rows:
 		key = (r["document_id"], r["section_id"])
 		if key in seen:
 			continue
 		seen.add(key)
 		item = {
-			"id": r["id"],
+			"id": r.get("id"),
 			"document_id": r["document_id"],
 			"section_id": r["section_id"],
 			"title": r["title"],
@@ -766,10 +1056,35 @@ def search_hybrid(
 			"document_type": r.get("document_type"),
 			"governing_law": r.get("governing_law"),
 			"industry": r.get("industry"),
+			"src": r.get("src"),
 		}
-		uniq.append(item)
+		if r.get("src") == "C":
+			clause_rows.append(item)
+		else:
+			section_rows.append(item)
 
-	return _attach_neighbors_and_defs(uniq, neighbor_window=neighbor_window, max_def_match=max_defs)
+	enriched_clauses = _attach_neighbors_and_defs(
+		clause_rows, neighbor_window=neighbor_window, max_def_match=max_defs
+	)
+	# Also enrich sections so they can contribute definitions
+	enriched_sections = _attach_neighbors_and_defs(
+		section_rows, neighbor_window=neighbor_window, max_def_match=max_defs
+	)
+	return enriched_clauses + enriched_sections
+
+
+# ---------------------------
+# Dense-only search (cosine)
+# ---------------------------
+def search(query: str, top_k: int = 15) -> List[Dict[str, Any]]:
+	"""Dense-only (cosine) search over clauses; keeps prior API for tools/tests."""
+	_ensure_schema()
+	_ensure_vector_index()
+	_ensure_fts()
+	_ensure_perf_indexes()
+	qvec = _embed_query(query)
+	rows = _search_dense(qvec, limit=top_k)
+	return _attach_neighbors_and_defs(rows)
 
 
 # ---------------------------
@@ -806,6 +1121,9 @@ def ingest_data_dir(data_dir: str = "./data") -> Dict[str, Any]:
 		indexer.index_chunks(doc, chunks, embs)
 		num_docs += 1
 		num_chunks += len(chunks)
+
+	# Rebuild section blobs after ingest so section index stays in sync
+	_rebuild_section_blobs(reembed=True)
 
 	return {"documents_indexed": num_docs, "chunks_indexed": num_chunks}
 
@@ -1133,3 +1451,8 @@ def retrieve_recursive(query: str, k: int = 8, max_hops: int = 2, relations: Opt
 		hops += 1
 	# Attach neighbors/defs across the final set
 	return _attach_neighbors_and_defs(out, neighbor_window=neighbor_window, max_def_match=max_defs) 
+
+
+def rebuild_sections(reembed: bool = True) -> None:
+	"""Public entrypoint to refresh section blobs."""
+	_rebuild_section_blobs(reembed=reembed) 
