@@ -3,6 +3,13 @@ from pathlib import Path
 from typing import List
 import sys
 
+# Load .env for local runs
+try:
+	from dotenv import load_dotenv, find_dotenv
+	load_dotenv(find_dotenv(), override=False)
+except Exception:
+	pass
+
 # Ensure project root is on sys.path when running as a script
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -14,7 +21,8 @@ from src.indexing import PgIndexer
 
 USE_MODAL_EMBED = os.getenv("USE_MODAL_EMBED", "0") in {"1", "true", "True"}
 
-def ingest_all(data_dir: str = "./data") -> None:
+
+def ingest_all(data_dir: str = os.getenv("DATA_DIR", "./data")) -> None:
 	pipeline = DocumentIngestionPipeline()
 	indexer = PgIndexer()
 	model = None
@@ -83,7 +91,7 @@ def backfill_missing_embeddings(batch_size: int = 1000) -> None:
 if __name__ == "__main__":
 	import argparse
 	parser = argparse.ArgumentParser(description="Ingest all documents from a directory into Postgres")
-	parser.add_argument("--data-dir", default="./data")
+	parser.add_argument("--data-dir", default=os.getenv("DATA_DIR", "./data"))
 	parser.add_argument("--use-modal", action="store_true", help="Use Modal for embeddings (overrides env)")
 	parser.add_argument("--backfill-missing", action="store_true", help="Embed rows with NULL embeddings")
 	args = parser.parse_args()

@@ -161,6 +161,12 @@ def main():
         if errs: status = "FAIL"
         elif warns: status = "WARN"
         print(f"  · {name:<20} {status}  items={len(pkg.get('items',[]))} defs={len(pkg.get('definitions',[]))}")
+        dbg = pkg.get("debug", {})
+        qt = dbg.get("queries_tried")
+        if qt:
+            print(f"      · retriever=LangDSPy, queries_tried={len(qt)}")
+        else:
+            print(f"      · retriever=legacy/fallback")
         for e in errs:  print(f"      ! {e}")
         for w in warns: print(f"      - {w}")
     # OCR noise
