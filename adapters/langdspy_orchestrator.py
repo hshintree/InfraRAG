@@ -10,27 +10,28 @@ from adapters.lc_blocks import make_multiquery_chain, make_hyde_chain, make_self
 from adapters.lc_pg_retriever import retrieve_with_pg
 from adapters.rerank import CrossEncoderReranker
 
-KEY_LAW_SLOTS = {"Governing Law"}
+KEY_LAW_SLOTS = {"Governing Law", "Dispute Resolution"}
 
 GUARDRAILS: Dict[str, Dict[str, List[str]]] = {
     "Parties": {
-        # no hard MUST; "between" is too generic and causes drift
-        "should": ["Parties","between","Seller","Buyer","this Agreement"],
+        "should": [
+            "Parties","this Agreement",
+            "Buyer","Seller","Vendor","Purchaser","Contractor","Employer",
+            "Lender","Borrower","Concessionaire","Grantor","Authority"
+        ],
     },
     "Purchase and Sale": {
-        "must": ["purchase","sale","Buyer","Seller"],
-        "should": ["subject matter","purchase","sale"],
+        "should": ["subject matter","purchase","sale","transfer","deliver"],
     },
     "Governing Law": {
         "must": ["govern"],
-        "should": ["governing law","New York"],
+        "should": ["governing law","laws of"],
     },
     "Dispute Resolution": {
         "must": ["arbitr"],
-        "should": ["seat","rules","LCIA","ICC","UNCITRAL","London","New York"],
+        "should": ["seat","rules","LCIA","ICC","UNCITRAL","SIAC","HKIAC","SCC","AAA","JAMS"],
     },
     "Definitions": {
-        # remove MUST; "mean" matches many non-def terms
         "should": ["means","shall mean","definition"],
     },
 }
@@ -108,6 +109,13 @@ class LangDSPyOrchestrator:
             return s if s.endswith('%') or '.' in s else (s + '%')
         return None
 
+    def _valid_law_code(self, val: Any) -> str | None:
+        if not val:
+            return None
+        s = str(val).strip().upper()
+        import re as _re
+        return s if _re.match(r"^[A-Z]{2}(-[A-Z]{2})?$", s) else None
+
     def _make_hyde_queries(self, hyde_terms: List[str], n: int = 2, width: int = 4) -> List[str]:
         out: List[str] = []
         if not hyde_terms:
@@ -139,17 +147,17 @@ class LangDSPyOrchestrator:
         if "enforce_constraints" in sq_filters:
             sq_filters["enforce_constraints"] = _as_bool(sq_filters["enforce_constraints"])
 
-        # Gated filters: only carry law/constraints for key law slots
         allow_law = spec.slot in KEY_LAW_SLOTS
         filters: Dict[str, Any] = {
             "filter_doc_type": None if allow_law else spec.doc_type,
             "filter_industry": None if allow_law else spec.industry,
         }
-        if allow_law and sq_filters.get("filter_law"):
-            filters["filter_law"] = sq_filters.get("filter_law")
-            filters["enforce_constraints"] = _as_bool(sq_filters.get("enforce_constraints", True))
+        if allow_law:
+            law = self._valid_law_code(sq_filters.get("filter_law"))
+            if law:
+                filters["filter_law"] = law
+                filters["enforce_constraints"] = _as_bool(sq_filters.get("enforce_constraints", True))
 
-        # Default heading_like to slot when unset; then validate/normalize
         heading_like = sq_filters.get("heading_like") or spec.slot
         hl = self._validate_like(heading_like)
         if not hl:
@@ -160,7 +168,6 @@ class LangDSPyOrchestrator:
         base_queries = [q for q in base if q]
         base_queries = list(dict.fromkeys(base_queries))
 
-        # Merge should tokens with HyDE-derived terms and guardrails; remove broad MUSTs already above
         should_combined: List[str] = []
         seen_tok: set[str] = set()
         guard = GUARDRAILS.get(spec.slot, {})
@@ -200,7 +207,6 @@ class LangDSPyOrchestrator:
         qb = self.synthesize(spec)
         pooled: List[Dict[str, Any]] = []
         tried: List[str] = []
-        # First pass over MQ queries
         for q in qb.base_queries:
             rows = retrieve_with_pg(
                 query=q,
@@ -217,7 +223,6 @@ class LangDSPyOrchestrator:
             pooled.extend(rows)
             tried.append(q)
 
-        # De-duplicate
         seen = set(); dedup: List[Dict[str, Any]] = []
         for r in pooled:
             k = (r.get("document_id"), r.get("section_id"))
@@ -225,7 +230,6 @@ class LangDSPyOrchestrator:
                 continue
             seen.add(k); dedup.append(r)
 
-        # HyDE backstop: if sparse, run 2-3 HyDE-derived clause-style queries
         if (self.hyde_mode == "backstop" or os.getenv("HYDE_BACKSTOP", "0") in {"1","true","True"}) and len(dedup) < 2:
             hyde_txt = self.hyde(spec.slot, spec.__dict__)
             hyde_terms = self._top_terms(hyde_txt, k=12)
@@ -244,14 +248,12 @@ class LangDSPyOrchestrator:
                     per_heading_cap=per_heading_cap,
                 )
                 pooled.extend(rows); tried.append(q)
-            # Re-dedupe
             seen = set(); dedup = []
             for r in pooled:
                 k = (r.get("document_id"), r.get("section_id"))
                 if k in seen: continue
                 seen.add(k); dedup.append(r)
 
-        # Rerank (optional)
         ranked = dedup
         if self.reranker and dedup:
             rr_query = RERANKER_QUERY.get(spec.slot, spec.slot)
@@ -271,8 +273,6 @@ class LangDSPyOrchestrator:
             "tokens": {"must": qb.must_tokens, "should": qb.should_tokens, "must_not": qb.must_not_tokens},
             "filters": qb.filters,
         }
-        if self._last_selfquery_raw:
-            dbg["selfquery_raw"] = self._last_selfquery_raw
         if self._last_selfquery_obj is not None:
             dbg["selfquery"] = self._last_selfquery_obj
 

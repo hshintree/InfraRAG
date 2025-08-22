@@ -53,32 +53,33 @@ SLOT_HINTS: Dict[str, Dict[str, Any]] = {
             "preamble parties this agreement is made by and between",
             "this agreement is made by and between the"
         ],
-        # no generic MUST; let should tokens guide scoring
-        "should": ["Parties", "between", "Seller", "Buyer", "this Agreement"],
+        "should": [
+            "Parties","between","this Agreement",
+            "Buyer","Seller","Vendor","Purchaser","Contractor","Employer",
+            "Lender","Borrower","Concessionaire","Grantor","Authority"
+        ],
     },
     "Definitions": {
         "queries": ["definitions", "interpretation definitions"],
-        # no brittle MUST; rely on heading_like and should tokens
         "should": ["means", "shall mean", "definition"],
         "heading_like": "1%"  # often 1. or 1.x
     },
     "Purchase and Sale": {
         "queries": ["purchase and sale", "sale and purchase", "subject matter"],
-        "must": ["purchase", "sale", "Buyer", "Seller"],
-        "should": ["purchase", "sale", "subject matter"],
-        "must_not": ["tax", "taxes", "withholding", "export", "sanction", "trade law",
-                      "assignment", "assign", "novate", "novation"],
+        # no hard MUSTs – allow supply/transfer style language in infra contracts
+        "should": ["purchase", "sale", "subject matter", "transfer", "deliver"],
     },
     "Price": {
         "queries": ["contract sales price", "purchase price", "price"],
-        "should": ["price", "pricing", "formula", "index", "LIBOR", "SOFR"],
+        "should": ["price", "pricing", "formula", "index", "LIBOR", "SOFR", "EURIBOR"],
     },
     "Adjustments": {
         "queries": ["price adjustment", "true-up", "final reconciliation", "adjustments"],
         "should": ["true-up", "adjustment", "reconciliation"],
     },
     "Closing": {
-        "queries": ["closing", "completion", "date of substantial completion", "date of full operations"],
+        # avoid EPC-specific phrases here; keep this generic for P&S and financing docs
+        "queries": ["closing", "completion"],
         "must": ["closing"],
         "should": ["closing", "completion"],
     },
@@ -110,17 +111,17 @@ SLOT_HINTS: Dict[str, Dict[str, Any]] = {
     "Governing Law": {
         "queries": ["governing law"],
         "must": ["govern"],
-        "should": ["governing law", "New York"],
+        "should": ["governing law","laws of"],
     },
     "Dispute Resolution": {
         "queries": ["dispute resolution", "arbitration", "venue seat rules"],
         "must": ["arbitr"],
-        "should": ["arbitration", "seat", "rules", "LCIA", "ICC", "UNCITRAL", "London", "New York"],
-        "must_not": ["court of", "litigation"],
+        # keep institutions broad; no cities/countries hard-coded
+        "should": ["arbitration","seat","rules","LCIA","ICC","UNCITRAL","SIAC","HKIAC","SCC","AAA","JAMS"],
     },
     "Notices": {
         "queries": ["notices", "form of notice", "delivery of notice"],
-        "should": ["notice", "address", "email", "copy to"],
+        "should": ["notice", "address", "email"],
     },
     "Termination": {
         "queries": ["termination", "termination events", "default and termination"],
@@ -232,13 +233,16 @@ def _drop_too_short(rows: List[Dict[str, Any]], min_chars: int = 280) -> List[Di
     return out or rows
 
 # --- soft backfill ---
-def _backfill_minimum(slot: str, primary: List[Dict[str, Any]], pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _backfill_minimum(slot: str, primary: List[Dict[str, Any]], pool: List[Dict[str, Any]], fallback: List[Dict[str, Any]] | None = None) -> List[Dict[str, Any]]:
     """If we filtered too aggressively, top up with next best long-ish items from pool."""
     need = (LAW_SLOT_MIN if slot in ("Governing Law",) else PER_SLOT_MIN) - len(primary)
     if need <= 0:
         return primary
     seen = {(r.get("doc_id") or r.get("document_id"), r.get("section_id")) for r in primary}
     candidates = [r for r in pool if (r.get("doc_id") or r.get("document_id"), r.get("section_id")) not in seen]
+    if len(candidates) < need and fallback:
+        extra = [r for r in fallback if (r.get("doc_id") or r.get("document_id"), r.get("section_id")) not in seen]
+        candidates += extra
     candidates = sorted(candidates, key=lambda r: (-len((r.get("content") or "")), -(float(r.get("rrf") or 0.0))))
     return primary + candidates[:need]
 
@@ -246,10 +250,10 @@ def _backfill_minimum(slot: str, primary: List[Dict[str, Any]], pool: List[Dict[
 import re as _re
 
 _SLOT_TOKENS = {
-    "Parties": ["parties", "preamble", "between"],
+    "Parties": ["parties", "preamble"],
     "Definitions": ["definition", "interpretation", "means", "shall mean"],
-    "Purchase and Sale": ["purchase", "sale", "subject matter", "shall sell", "shall purchase", "shall buy", "shall take"],
-    "Price": ["price", "pricing", "formula", "index"],
+    "Purchase and Sale": ["purchase", "sale", "subject matter", "shall sell", "shall purchase", "shall buy", "shall take", "transfer", "deliver"],
+    "Price": ["price", "pricing", "formula", "index", "libor", "sofr", "euribor"],
     "Adjustments": ["adjust", "true-up", "reconcil"],
     "Closing": ["closing", "completion"],
     "CPs": ["condition precedent", "conditions to closing"],
@@ -259,7 +263,7 @@ _SLOT_TOKENS = {
     "Indemnities": ["indemn", "hold harmless", "defend"],
     "Limitations": ["limitation", "limitations", "consequential", "lost profits", "cap"],
     "Governing Law": ["governing law", "governed by the laws"],
-    "Dispute Resolution": ["arbitra", "seat", "rules", "lcia", "icc", "uncitral"],
+    "Dispute Resolution": ["arbitra","seat","rules","lcia","icc","uncitral","siac","hkiac","scc","aaa","jams"],
     "Notices": ["notice", "address", "email"],
     "Termination": ["terminate", "termination", "event of default"],
     "Miscellaneous": ["entire agreement", "severability", "amendment", "waiver", "assignment"],
@@ -278,8 +282,10 @@ _CLAUSE_TYPE_MAP = {
 }
 
 _PAT = {
-    "parties": _re.compile(r"\b(by and between|made by and between)\b", _re.I),
-    "defs": _re.compile(r"\b(“[^”]{2,80}”|\"[^\"]{2,80}\")\s+(means|shall\s+mean)\b", _re.I),
+    "parties": _re.compile(r"\b(this agreement\s+is\s+made\s+by\s+and\s+between|by\s+and\s+between)\b", _re.I),
+    "defs": _re.compile(r"(“[^”]{2,80}”|\"[^\"]{2,80}\")\s+(means|shall\s+mean)\b", _re.I),
+    "defs_many": _re.compile(r"((“[^”]{2,80}”|\"[^\"]{2,80}\")\s+(means|shall\s+mean)\b.*?){3,}", _re.I|_re.S),
+    "rw_phrase": _re.compile(r"\brepresent(s|ations)?\s+and\s+warrant(s|ies)?\b", _re.I),
     "ps_sell": _re.compile(r"\bshall\s+sell\b", _re.I),
     "ps_take": _re.compile(r"\b(shall\s+purchase|shall\s+buy|shall\s+take)\b", _re.I),
     "indemn": _re.compile(r"\b(indemnif\w*|hold harmless|defend)\b", _re.I),
@@ -287,11 +293,27 @@ _PAT = {
     "cp": _re.compile(r"\b(condition[s]?\s+precedent|conditions?\s+to\s+closing)\b", _re.I),
     "close": _re.compile(r"\b(closing (date)?|completion)\b", _re.I),
     "govlaw": _re.compile(r"\bgoverned by the laws?\b", _re.I),
+    "govlaw_strict": _re.compile(r"\bshall\s+be\s+governed\b.{0,40}\blaws?\b", _re.I),
+    "conflicts": _re.compile(r"without\s+regard\s+to\s+(the\s+)?conflict(s)?\s+of\s+law", _re.I),
     "arb": _re.compile(r"\barbitra\w+\b|\bLCIA\b|\bICC\b|\bUNCITRAL\b|\bseat of arbitration\b", _re.I),
     "notice": _re.compile(r"\bnotice\b", _re.I),
     "term": _re.compile(r"\b(terminate|termination|event of default)\b", _re.I),
     "misc": _re.compile(r"\b(entire agreement|severability|amendment|waiver|assignment)\b", _re.I),
 }
+
+def slot_gate(slot: str, text: str) -> bool:
+    tl = (text or "").lower()
+    if slot == "Governing Law":
+        return bool(_PAT["govlaw_strict"].search(tl))
+    if slot == "Dispute Resolution":
+        return ("arbitra" in tl)
+    if slot == "Parties":
+        return bool(_PAT["parties"].search(tl)) or ("parties" in tl)
+    if slot == "Definitions":
+        return bool(_PAT["defs"].search(text or ""))
+    if slot == "Purchase and Sale":
+        return ("purchase and sale" in tl) or bool(_PAT["ps_sell"].search(tl) or _PAT["ps_take"].search(tl))
+    return True
 
 def _slot_score_generic(slot: str, item: Dict[str, Any], constraints: Dict[str, Any]) -> float:
     title = (item.get("title") or "").lower()
@@ -300,6 +322,7 @@ def _slot_score_generic(slot: str, item: Dict[str, Any], constraints: Dict[str, 
     L = len(text)
 
     score = 0.0
+    # soft title cue (first word of slot or key alias)
     if slot.lower().split()[0] in title:
         score += 1.0
     for tok in _SLOT_TOKENS.get(slot, []):
@@ -312,17 +335,57 @@ def _slot_score_generic(slot: str, item: Dict[str, Any], constraints: Dict[str, 
     if L >= 900:   score += 0.8
     elif L >= 600: score += 0.5
     elif L >= 350: score += 0.2
+    if slot == "Definitions":
+        if _PAT["defs_many"].search(text):
+            score += 0.8
+        elif _PAT["defs"].search(text):
+            score += 0.4
+        else:
+            score -= 0.6
+    # light demotion for common noise near P&S (but allow real hits to win)
     off = ("tax", "withholding", "export", "sanction", "assignment", "novat")
     if slot == "Purchase and Sale" and any(w in tlow for w in off):
-        score -= 0.8
+        score -= 0.35
+
+    # slot-specific regex signals (lift ties; reduce off-topic)
+    if slot == "Parties" and _PAT["parties"].search(tlow):
+        score += 0.8
+    if slot == "Definitions" and _PAT["defs"].search(item.get("content") or ""):
+        score += 0.7
+    if slot in ("R&W - Seller","R&W - Buyer"):
+        if _PAT["rw_phrase"].search(tlow): score += 0.6
+        role = "seller" if "seller" in slot.lower() else "buyer"
+        if role in title: score += 0.5
+
+    if slot == "Governing Law":
+        if _PAT["govlaw_strict"].search(tlow):
+            score += 0.9
+        else:
+            score -= 0.6
+        if _PAT["conflicts"].search(tlow):
+            score += 0.3
+        if ("prohibited practices" in tlow) or ("anti-corruption" in tlow):
+            score -= 0.4
+
+    if slot == "Purchase and Sale":
+        if ("purchase and sale" in title) or _PAT["ps_sell"].search(tlow) or _PAT["ps_take"].search(tlow):
+            score += 0.5
+        else:
+            score -= 0.3
+
     if slot == "Dispute Resolution":
         seat = (constraints or {}).get("arbitration_seat", "")
         if seat and seat.lower() in tlow:
             score += 0.7
-        if any(k in tlow for k in ("lcia", "icc", "uncitral")):
-            score += 0.5
-        if seat and any(k in tlow for k in ("aaa", " jams ")):
+        if any(k in tlow for k in ("lcia","icc","uncitral","siac","hkiac","scc","aaa","jams")):
+            score += 0.4
+        # generic: if the clause is litigation-heavy and lacks arbitra* cues, nudge down a bit
+        if ("court" in tlow or "litigation" in tlow) and ("arbitra" not in tlow):
             score -= 0.4
+
+    # light token density bonus to break rrf ties
+    tok_hits = sum(t in tlow for t in (x.lower() for x in _SLOT_TOKENS.get(slot, [])))
+    score += min(0.25, 0.03 * tok_hits)
     return score
 
 def _rank_and_filter(slot: str, items: List[Dict[str, Any]], constraints: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -332,7 +395,10 @@ def _rank_and_filter(slot: str, items: List[Dict[str, Any]], constraints: Dict[s
         title = (r.get("title") or "").lower()
         tlow  = (r.get("content") or "").lower()
         tokens = _SLOT_TOKENS.get(slot, [])
-        ok = any(tok in title for tok in tokens) or any(tok in tlow for tok in tokens)
+        if slot == "Parties":
+            ok = ("parties" in title) or bool(_PAT["parties"].search(r.get("content") or ""))
+        else:
+            ok = any(tok in title for tok in tokens) or any(tok in tlow for tok in tokens)
         if not tokens:
             ok = True
         ctype = (r.get("clause_type") or "")
@@ -342,21 +408,27 @@ def _rank_and_filter(slot: str, items: List[Dict[str, Any]], constraints: Dict[s
         if ok:
             coarse.append(r)
     pool = coarse if coarse else items
-    ranked = sorted(
-        pool,
-        key=lambda r: (_slot_score_generic(slot, r, constraints), float(r.get("rrf") or 0.0)),
-        reverse=True,
-    )
+    def _tiebreak_key(r: Dict[str, Any]):
+        s = _slot_score_generic(slot, r, constraints)
+        tlow = (r.get("content") or "").lower()
+        title = (r.get("title") or "").lower()
+        gate_ok = slot_gate(slot, r.get("content") or "")
+        title_exact = _title_matches(slot, title)
+        length = len(r.get("content") or "")
+        ctype = (r.get("clause_type") or "").lower()
+        ctype_hit = 1 if any(w.lower() in ctype for w in (_CLAUSE_TYPE_MAP.get(slot) or [])) else 0
+        return (gate_ok, title_exact, ctype_hit, s, float(r.get("rrf") or 0.0), length)
+    ranked = sorted(pool, key=_tiebreak_key, reverse=True)
     return ranked
 
 # ----------------- retrieval plan per slot -----------------
 def _filters_from_spec(spec: Dict[str, Any], slot: str) -> Dict[str, Any]:
     """Translate spec into retrieval filters/boosts by slot."""
+    fat = {"R&W - Seller","R&W - Buyer","Indemnities","Limitations","Notices","Covenants","Termination","Definitions"}
     filters: Dict[str, Any] = {
         "filter_doc_type": spec.get("doc_type"),
         "filter_industry": spec.get("industry"),
-        # neighbor/defs tuned here; ok to override via CLI
-        "neighbor_window": 1,
+        "neighbor_window": 2 if slot in fat else 1,
         "max_defs": 6,
         "expand_sparse": True,
     }
@@ -377,19 +449,17 @@ def _slot_query_and_tokens(slot: str, spec: Dict[str, Any]) -> Tuple[str, List[s
     must = hints.get("must", [])
     should = hints.get("should", [])
     must_not: List[str] = hints.get("must_not", [])
+
     # Add constraint-guided tokens for key slots
     if slot == "Dispute Resolution":
         seat = (spec.get("constraints") or {}).get("arbitration_seat")
         if seat:
             should = list(dict.fromkeys(should + [seat]))
-        law = (spec.get("constraints") or {}).get("law")
-        if law and law.lower() in ("ny","new york","us-ny"):
-            should = list(dict.fromkeys(should + ["New York"]))
         must = list(dict.fromkeys(must + ["arbitr"]))
     if slot == "Governing Law":
         law = (spec.get("constraints") or {}).get("law")
-        if law and law.lower() in ("ny","new york","us-ny"):
-            should = list(dict.fromkeys(should + ["New York"]))
+        if law:
+            should = list(dict.fromkeys(should + [str(law)]))
         must = list(dict.fromkeys(must + ["govern"]))
     return base_q, must, must_not, should, hints.get("heading_like")
 
@@ -406,15 +476,18 @@ def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int =
                 constraints=spec.get("constraints") or {},
             )
             print(f"[langdspy] slot={slot} (auto queries)")
-            pkg = ORCH.retrieve_slot(sp, pool_n=pool_n, top_k=top_k)
+            fat = {"R&W - Seller","R&W - Buyer","Indemnities","Limitations","Notices","Covenants","Termination","Definitions"}
+            per_heading_cap = 2 if slot in fat else 1
+            pkg = ORCH.retrieve_slot(sp, pool_n=pool_n, top_k=top_k, per_heading_cap=per_heading_cap)
             # If empty, fall back to legacy path
             if pkg.items:
                 # Rank + quality filter then length drop, title-bias, cap + floor
                 ranked = _rank_and_filter(slot, pkg.items, spec.get("constraints") or {})
-                ranked = _drop_too_short(ranked, min_chars=240)
+                ranked = _drop_too_short(ranked, min_chars=300)
                 ranked = _prefer_title_matches(slot, ranked)
                 prelim = ranked[:PER_SLOT_MAX]
-                capped = _backfill_minimum(slot, prelim, ranked)
+                fallback_pool = pkg.items
+                capped = _backfill_minimum(slot, prelim, ranked, fallback=fallback_pool)
                 # Rebuild sources/defs reflecting new order
                 _sources: List[Dict[str, Any]] = []
                 _defs: List[Dict[str, Any]] = []
@@ -487,13 +560,14 @@ def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int =
     preferred = [r for r in (rows + scoped) if r.get("src") == "C"] or (rows + scoped)
     # Length drop, rank, title-bias
     stitched = _merge_adjacent(preferred, cap_chars=merge_cap) if merge_adjacent else preferred
-    stitched = _drop_too_short(stitched, min_chars=240)
+    stitched = _drop_too_short(stitched, min_chars=300)
     stitched = _rank_and_filter(slot, stitched, spec.get("constraints") or {})
     stitched = _prefer_title_matches(slot, stitched)
 
     # Post-filter then cap + floor
     prelim = _take_top(stitched, n=min(PER_SLOT_MAX, top_k))
-    top_items = _backfill_minimum(slot, prelim, stitched)
+    fallback_pool = sorted((rows + scoped), key=lambda r: (-(len((r.get("content") or ""))), -(float(r.get("rrf") or 0.0))))
+    top_items = _backfill_minimum(slot, prelim, stitched, fallback=fallback_pool)
     sources = []
     for r in top_items:
         srcs = r.get("sources") or [{"doc_id": r["document_id"], "section_id": r["section_id"], "title": r.get("title")}]
@@ -624,8 +698,8 @@ def build_scp(spec: Dict[str, Any], include_optional: bool = True, top_k: int = 
         "fat_slots_per_heading_cap": {"R&W - Seller": 2, "R&W - Buyer": 2, "Indemnities": 2, "Limitations": 2},
     }
     retrieval_params.update({
-        "sparse_weight": 0.6,
-        "should_weight": 0.05,
+        "sparse_weight": 0.58,
+        "should_weight": 0.09,
         "pool_n": pool_n,
         "top_k": top_k,
         "use_section_blobs": True,
@@ -652,14 +726,14 @@ def build_scp(spec: Dict[str, Any], include_optional: bool = True, top_k: int = 
 
 def _default_spec() -> Dict[str, Any]:
     return {
-        "doc_type": "Purchase Agreement",
-        "jurisdiction": "CO",
-        "industry": "Power",
+        "doc_type": None,
+        "jurisdiction": None,
+        "industry": None,
         "required": ["Parties","Definitions","Purchase and Sale","Price","Adjustments","Closing","CPs",
                      "R&W - Seller","R&W - Buyer","Covenants","Indemnities","Limitations","Governing Law",
                      "Dispute Resolution","Notices","Termination","Miscellaneous"],
         "optional": ["Change of Control","Performance Guarantee","Tax Matters","Environmental","Insurance"],
-        "constraints": {"arbitration_seat":"London","law":"NY"},
+        "constraints": {},
     }
 
 def _slot_best_by_doc(slot_pkg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:

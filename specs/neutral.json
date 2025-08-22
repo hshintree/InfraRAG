@@ -1,0 +1,13 @@
+{
+    "doc_type": null,
+    "jurisdiction": null,
+    "industry": null,
+    "required": [
+      "Parties", "Definitions", "Purchase and Sale", "Price", "Adjustments",
+      "Closing", "CPs", "R&W - Seller", "R&W - Buyer", "Covenants",
+      "Indemnities", "Limitations", "Governing Law", "Dispute Resolution",
+      "Notices", "Termination", "Miscellaneous"
+    ],
+    "optional": ["Change of Control", "Performance Guarantee", "Tax Matters", "Environmental", "Insurance"],
+    "constraints": {}
+  }
