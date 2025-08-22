@@ -18,6 +18,19 @@ try:
 except Exception:
     pass
 
+# Normalize HF auth/cache envs for huggingface_hub and sentence-transformers
+_hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+if _hf_token:
+    os.environ.setdefault("HUGGINGFACEHUB_API_TOKEN", _hf_token)
+    os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", _hf_token)
+    os.environ.setdefault("HF_TOKEN", _hf_token)
+_hf_home = os.getenv("HF_HOME")
+if _hf_home:
+    os.environ["HF_HOME"] = os.path.expanduser(_hf_home)
+_hf_transfer = os.getenv("HF_HUB_ENABLE_HF_TRANSFER")
+if _hf_transfer:
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = _hf_transfer
+
 # Force local embeddings for this process before importing retriever (import reads env)
 os.environ["USE_MODAL_EMBED"] = os.getenv("USE_MODAL_EMBED", "0")
 
@@ -25,7 +38,13 @@ from adapters.retrieval_adapter import search_hybrid  # you already expose this
 
 PER_SLOT_MAX = int(os.getenv("SCP_PER_SLOT_MAX", "3"))
 PER_SLOT_MIN = int(os.getenv("SCP_PER_SLOT_MIN", "2"))
-LAW_SLOT_MIN = int(os.getenv("SCP_LAW_SLOT_MIN", "1"))
+
+# --- slot-specific floors ---
+SLOT_MIN = {
+    "Governing Law": 1,
+    "Dispute Resolution": 2,
+}
+DEFAULT_MIN = PER_SLOT_MIN
 
 # LangDSPy orchestrator (optional, global)
 USE_LANG_DSPY = os.getenv("USE_LANG_DSPY", "0").lower() in ("1", "true")
@@ -80,7 +99,6 @@ SLOT_HINTS: Dict[str, Dict[str, Any]] = {
     "Closing": {
         # avoid EPC-specific phrases here; keep this generic for P&S and financing docs
         "queries": ["closing", "completion"],
-        "must": ["closing"],
         "should": ["closing", "completion"],
     },
     "CPs": {
@@ -101,7 +119,6 @@ SLOT_HINTS: Dict[str, Dict[str, Any]] = {
     },
     "Indemnities": {
         "queries": ["indemnity", "indemnification", "liabilities and indemnification"],
-        "must": ["indemn"],
         "should": ["indemnify", "defend", "hold harmless"],
     },
     "Limitations": {
@@ -110,12 +127,10 @@ SLOT_HINTS: Dict[str, Dict[str, Any]] = {
     },
     "Governing Law": {
         "queries": ["governing law"],
-        "must": ["govern"],
         "should": ["governing law","laws of"],
     },
     "Dispute Resolution": {
         "queries": ["dispute resolution", "arbitration", "venue seat rules"],
-        "must": ["arbitr"],
         # keep institutions broad; no cities/countries hard-coded
         "should": ["arbitration","seat","rules","LCIA","ICC","UNCITRAL","SIAC","HKIAC","SCC","AAA","JAMS"],
     },
@@ -141,7 +156,6 @@ SLOT_HINTS: Dict[str, Dict[str, Any]] = {
             "ownership change",
             "assignment novation (control)"
         ],
-        "must": ["control"],
         "should": [
             "change of control", "change in control", "majority", "voting",
             "ownership", "assignment", "novation", "directly or indirectly"
@@ -235,7 +249,7 @@ def _drop_too_short(rows: List[Dict[str, Any]], min_chars: int = 280) -> List[Di
 # --- soft backfill ---
 def _backfill_minimum(slot: str, primary: List[Dict[str, Any]], pool: List[Dict[str, Any]], fallback: List[Dict[str, Any]] | None = None) -> List[Dict[str, Any]]:
     """If we filtered too aggressively, top up with next best long-ish items from pool."""
-    need = (LAW_SLOT_MIN if slot in ("Governing Law",) else PER_SLOT_MIN) - len(primary)
+    need = (SLOT_MIN.get(slot, DEFAULT_MIN)) - len(primary)
     if need <= 0:
         return primary
     seen = {(r.get("doc_id") or r.get("document_id"), r.get("section_id")) for r in primary}
@@ -306,7 +320,7 @@ def slot_gate(slot: str, text: str) -> bool:
     if slot == "Governing Law":
         return bool(_PAT["govlaw_strict"].search(tl))
     if slot == "Dispute Resolution":
-        return ("arbitra" in tl)
+        return ("arbitra" in tl) or ("dispute resolution" in tl)
     if slot == "Parties":
         return bool(_PAT["parties"].search(tl)) or ("parties" in tl)
     if slot == "Definitions":
@@ -397,6 +411,8 @@ def _rank_and_filter(slot: str, items: List[Dict[str, Any]], constraints: Dict[s
         tokens = _SLOT_TOKENS.get(slot, [])
         if slot == "Parties":
             ok = ("parties" in title) or bool(_PAT["parties"].search(r.get("content") or ""))
+        elif slot == "Dispute Resolution":
+            ok = ("dispute resolution" in title) or ("arbitra" in tlow) or ("arbitr" in title)
         else:
             ok = any(tok in title for tok in tokens) or any(tok in tlow for tok in tokens)
         if not tokens:
@@ -407,7 +423,9 @@ def _rank_and_filter(slot: str, items: List[Dict[str, Any]], constraints: Dict[s
             ok = True
         if ok:
             coarse.append(r)
-    pool = coarse if coarse else items
+    # Prefer title/token matches, then regex-gated, then raw
+    gate_filtered = [r for r in items if slot_gate(slot, r.get("content") or "")]
+    pool = coarse or gate_filtered or items
     def _tiebreak_key(r: Dict[str, Any]):
         s = _slot_score_generic(slot, r, constraints)
         tlow = (r.get("content") or "").lower()
@@ -417,7 +435,8 @@ def _rank_and_filter(slot: str, items: List[Dict[str, Any]], constraints: Dict[s
         length = len(r.get("content") or "")
         ctype = (r.get("clause_type") or "").lower()
         ctype_hit = 1 if any(w.lower() in ctype for w in (_CLAUSE_TYPE_MAP.get(slot) or [])) else 0
-        return (gate_ok, title_exact, ctype_hit, s, float(r.get("rrf") or 0.0), length)
+        rrfv = float(r.get("rrf") or 0.0)
+        return (gate_ok, title_exact, round(s, 3), round(rrfv, 3), ctype_hit, length)
     ranked = sorted(pool, key=_tiebreak_key, reverse=True)
     return ranked
 
@@ -425,11 +444,12 @@ def _rank_and_filter(slot: str, items: List[Dict[str, Any]], constraints: Dict[s
 def _filters_from_spec(spec: Dict[str, Any], slot: str) -> Dict[str, Any]:
     """Translate spec into retrieval filters/boosts by slot."""
     fat = {"R&W - Seller","R&W - Buyer","Indemnities","Limitations","Notices","Covenants","Termination","Definitions"}
+    law = {"Governing Law","Dispute Resolution"}
     filters: Dict[str, Any] = {
         "filter_doc_type": spec.get("doc_type"),
         "filter_industry": spec.get("industry"),
-        "neighbor_window": 2 if slot in fat else 1,
-        "max_defs": 6,
+        "neighbor_window": 2 if (slot in fat or slot in law) else 1,
+        "max_defs": 0 if slot in law else 6,
         "expand_sparse": True,
     }
     constraints = (spec.get("constraints") or {})
@@ -455,16 +475,23 @@ def _slot_query_and_tokens(slot: str, spec: Dict[str, Any]) -> Tuple[str, List[s
         seat = (spec.get("constraints") or {}).get("arbitration_seat")
         if seat:
             should = list(dict.fromkeys(should + [seat]))
-        must = list(dict.fromkeys(must + ["arbitr"]))
     if slot == "Governing Law":
         law = (spec.get("constraints") or {}).get("law")
         if law:
             should = list(dict.fromkeys(should + [str(law)]))
-        must = list(dict.fromkeys(must + ["govern"]))
     return base_q, must, must_not, should, hints.get("heading_like")
 
 
 def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int = 300, scoped_top_k: int = 3, merge_adjacent: bool = True, merge_cap: int = 2200) -> Dict[str, Any]:
+    # Bump depth for law slots
+    law = {"Governing Law","Dispute Resolution"}
+    local_top_k = top_k
+    local_pool_n = pool_n
+    if slot in law:
+        local_top_k = max(top_k, 8)
+        local_pool_n = max(pool_n, 600)
+    # Disable merging for DR to keep multiple hits distinct
+    merge_adjacent_local = (False if slot == "Dispute Resolution" else merge_adjacent)
     # Optional LangChain + DSPy orchestrator (global ORCH)
     if ORCH:
         try:
@@ -477,8 +504,9 @@ def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int =
             )
             print(f"[langdspy] slot={slot} (auto queries)")
             fat = {"R&W - Seller","R&W - Buyer","Indemnities","Limitations","Notices","Covenants","Termination","Definitions"}
-            per_heading_cap = 2 if slot in fat else 1
-            pkg = ORCH.retrieve_slot(sp, pool_n=pool_n, top_k=top_k, per_heading_cap=per_heading_cap)
+            law = {"Governing Law","Dispute Resolution"}
+            per_heading_cap = 2 if (slot in fat or slot in law) else 1
+            pkg = ORCH.retrieve_slot(sp, pool_n=local_pool_n, top_k=local_top_k, per_heading_cap=per_heading_cap)
             # If empty, fall back to legacy path
             if pkg.items:
                 # Rank + quality filter then length drop, title-bias, cap + floor
@@ -519,13 +547,18 @@ def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int =
 
     # per-heading cap per slot
     fat = {"R&W - Seller","R&W - Buyer","Indemnities","Limitations","Notices","Covenants","Termination","Definitions"}
-    per_heading_cap = 2 if slot in fat else 1
+    law = {"Governing Law","Dispute Resolution"}
+    per_heading_cap = 2 if (slot in fat or slot in law) else 1
 
     # Pass 1: broad, metadata-aware
+    if slot == "Governing Law":
+        must_not = ["prohibited practices","anti-corruption","export control","sanctions","compliance program"]
+    else:
+        must_not = must_not
     rows = search_hybrid(
         base_q,
-        pool_n=pool_n,
-        top_k=top_k,
+        pool_n=local_pool_n,
+        top_k=local_top_k,
         must_tokens=must or None,
         must_not_tokens=must_not or None,
         should_tokens=should or None,
@@ -543,7 +576,7 @@ def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int =
             prefer_doc = Counter(top_docs).most_common(1)[0][0]
             scoped = search_hybrid(
                 base_q,
-                pool_n=pool_n,
+                pool_n=local_pool_n,
                 top_k=scoped_top_k,
                 must_tokens=must or None,
                 must_not_tokens=must_not or None,
@@ -559,13 +592,32 @@ def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int =
     # Prefer clause hits if present (neighbors/seq), else fall back to sections
     preferred = [r for r in (rows + scoped) if r.get("src") == "C"] or (rows + scoped)
     # Length drop, rank, title-bias
-    stitched = _merge_adjacent(preferred, cap_chars=merge_cap) if merge_adjacent else preferred
+    stitched = _merge_adjacent(preferred, cap_chars=merge_cap) if merge_adjacent_local else preferred
     stitched = _drop_too_short(stitched, min_chars=300)
     stitched = _rank_and_filter(slot, stitched, spec.get("constraints") or {})
     stitched = _prefer_title_matches(slot, stitched)
 
+    # DR rescue pass if still short
+    if slot == "Dispute Resolution" and len(stitched) < 2:
+        rescue = search_hybrid(
+            query="dispute resolution arbitration clause",
+            pool_n=local_pool_n * 2,
+            top_k=max(6, local_top_k * 2),
+            must_tokens=None,
+            must_not_tokens=None,
+            should_tokens=["arbitration","seat","rules","tribunal","arbitrator","institution"],
+            sparse_weight=0.58,
+            should_weight=0.09,
+            per_heading_cap=2,
+            **{k: v for k, v in filters.items() if k != "filter_law"}
+        )
+        stitched += rescue
+        stitched = _drop_too_short(stitched, min_chars=300)
+        stitched = _rank_and_filter(slot, stitched, spec.get("constraints") or {})
+        stitched = _prefer_title_matches(slot, stitched)
+
     # Post-filter then cap + floor
-    prelim = _take_top(stitched, n=min(PER_SLOT_MAX, top_k))
+    prelim = _take_top(stitched, n=min(PER_SLOT_MAX, local_top_k))
     fallback_pool = sorted((rows + scoped), key=lambda r: (-(len((r.get("content") or ""))), -(float(r.get("rrf") or 0.0))))
     top_items = _backfill_minimum(slot, prelim, stitched, fallback=fallback_pool)
     sources = []

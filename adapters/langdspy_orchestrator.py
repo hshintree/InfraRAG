@@ -24,11 +24,9 @@ GUARDRAILS: Dict[str, Dict[str, List[str]]] = {
         "should": ["subject matter","purchase","sale","transfer","deliver"],
     },
     "Governing Law": {
-        "must": ["govern"],
         "should": ["governing law","laws of"],
     },
     "Dispute Resolution": {
-        "must": ["arbitr"],
         "should": ["seat","rules","LCIA","ICC","UNCITRAL","SIAC","HKIAC","SCC","AAA","JAMS"],
     },
     "Definitions": {
@@ -64,11 +62,33 @@ class LangDSPyOrchestrator:
         self.reranker = None
         self._last_selfquery_raw: str | None = None
         self._last_selfquery_obj: Dict[str, Any] | None = None
+
+        # Normalize HF auth/cache for CrossEncoder
+        _hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+        if _hf_token:
+            os.environ.setdefault("HUGGINGFACEHUB_API_TOKEN", _hf_token)
+            os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", _hf_token)
+            os.environ.setdefault("HF_TOKEN", _hf_token)
+        _hf_home = os.getenv("HF_HOME")
+        if _hf_home:
+            os.environ["HF_HOME"] = os.path.expanduser(_hf_home)
+        _hf_transfer = os.getenv("HF_HUB_ENABLE_HF_TRANSFER")
+        if _hf_transfer:
+            os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = _hf_transfer
+
         reranker_model = os.getenv("RERANKER_MODEL")
         if reranker_model:
             try:
+                # Encourage offline cache usage if available
+                os.environ.setdefault("HF_HOME", os.getenv("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
+                os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
                 self.reranker = CrossEncoderReranker(reranker_model)
-            except Exception:
+                # Optional warmup to ensure model is downloaded and usable
+                if os.getenv("RERANKER_WARMUP", "0").lower() in ("1","true","yes"):
+                    _ = self.reranker.rerank("warmup", [{"content": "warmup"}], top_k=1)
+                print(f"[reranker] ready: {reranker_model}")
+            except Exception as e:
+                print(f"[reranker] DISABLED (load error): {e}")
                 self.reranker = None
 
         self.mq = make_multiquery_chain(llm, self.n)
