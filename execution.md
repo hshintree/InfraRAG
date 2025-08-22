@@ -98,6 +98,8 @@ checking db:
 docker exec -i infra-postgres psql -U postgres -d infra_rag -c "SELECT document_id, COUNT(*) AS clauses FROM clauses GROUP BY 1 ORDER BY 1"
 docker exec -i infra-postgres psql -U postgres -d infra_rag -f - \
   < /Users/hakeemshindy/Desktop/InfraRAG/adapters/test.sql
+
+RERANKER_WARMUP=1 USE_MODAL_EMBED=0 python adapters/build_scp.py --spec-file specs/col_power.json --parallel 1 --out artifacts
 ```
 
 ### 6) Tuning knobs (env vars)
