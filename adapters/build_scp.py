@@ -38,6 +38,7 @@ from adapters.retrieval_adapter import search_hybrid  # you already expose this
 
 PER_SLOT_MAX = int(os.getenv("SCP_PER_SLOT_MAX", "3"))
 PER_SLOT_MIN = int(os.getenv("SCP_PER_SLOT_MIN", "2"))
+GEN_PER_SLOT_MAX = int(os.getenv("GEN_PER_SLOT_MAX", "10"))
 
 # --- slot-specific floors ---
 SLOT_MIN = {
@@ -410,7 +411,7 @@ def _rank_and_filter(slot: str, items: List[Dict[str, Any]], constraints: Dict[s
         tlow  = (r.get("content") or "").lower()
         tokens = _SLOT_TOKENS.get(slot, [])
         if slot == "Parties":
-            ok = ("parties" in title) or bool(_PAT["parties"].search(r.get("content") or ""))
+            ok = bool(_PAT["parties"].search(r.get("content") or ""))
         elif slot == "Dispute Resolution":
             ok = ("dispute resolution" in title) or ("arbitra" in tlow) or ("arbitr" in title)
         else:
@@ -423,9 +424,7 @@ def _rank_and_filter(slot: str, items: List[Dict[str, Any]], constraints: Dict[s
             ok = True
         if ok:
             coarse.append(r)
-    # Prefer title/token matches, then regex-gated, then raw
-    gate_filtered = [r for r in items if slot_gate(slot, r.get("content") or "")]
-    pool = coarse or gate_filtered or items
+    pool = coarse if coarse else items
     def _tiebreak_key(r: Dict[str, Any]):
         s = _slot_score_generic(slot, r, constraints)
         tlow = (r.get("content") or "").lower()
@@ -436,6 +435,9 @@ def _rank_and_filter(slot: str, items: List[Dict[str, Any]], constraints: Dict[s
         ctype = (r.get("clause_type") or "").lower()
         ctype_hit = 1 if any(w.lower() in ctype for w in (_CLAUSE_TYPE_MAP.get(slot) or [])) else 0
         rrfv = float(r.get("rrf") or 0.0)
+        # Demote misleading 'Third Parties' headings for Parties slot
+        if slot == "Parties" and "third part" in title:
+            s -= 2.0
         return (gate_ok, title_exact, round(s, 3), round(rrfv, 3), ctype_hit, length)
     ranked = sorted(pool, key=_tiebreak_key, reverse=True)
     return ranked
@@ -458,8 +460,8 @@ def _filters_from_spec(spec: Dict[str, Any], slot: str) -> Dict[str, Any]:
         if constraints.get("law"):
             filters["filter_law"] = constraints["law"]
             filters["enforce_constraints"] = True
-        filters["filter_doc_type"] = None
-        filters["filter_industry"] = None
+        # Do not un-scope doc_type/industry here unless an explicit doc lock is later applied
+        # Keep existing doc_type/industry to prevent cross-family drift
     return filters
 
 
@@ -516,6 +518,7 @@ def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int =
                 prelim = ranked[:PER_SLOT_MAX]
                 fallback_pool = pkg.items
                 capped = _backfill_minimum(slot, prelim, ranked, fallback=fallback_pool)
+                gen_items_ranked = _take_top(ranked, n=min(GEN_PER_SLOT_MAX, max(local_top_k*2, 12)))
                 # Rebuild sources/defs reflecting new order
                 _sources: List[Dict[str, Any]] = []
                 _defs: List[Dict[str, Any]] = []
@@ -531,6 +534,17 @@ def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int =
                     "should": pkg.debug.get("tokens", {}).get("should", []),
                     "filters": pkg.debug.get("filters", {}),
                     "items": capped,
+                    "gen_items": [
+                        {
+                            "doc_id": r["document_id"], "section_id": r["section_id"],
+                            "title": r.get("title"), "heading_number": r.get("heading_number"),
+                            "seq": r.get("seq"), "rrf": r.get("rrf"), "content": r.get("content"),
+                            "neighbors": r.get("neighbors") or [], "definitions": r.get("definitions") or [],
+                            "sources": r.get("sources") or [{"doc_id": r["document_id"], "section_id": r["section_id"], "title": r.get("title")}],
+                            "merged_count": r.get("merged_count"),
+                        }
+                        for r in gen_items_ranked
+                    ],
                     "sources": _sources,
                     "definitions": _defs,
                     "debug": pkg.debug,
@@ -618,6 +632,7 @@ def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int =
 
     # Post-filter then cap + floor
     prelim = _take_top(stitched, n=min(PER_SLOT_MAX, local_top_k))
+    gen_items = _take_top(stitched, n=min(GEN_PER_SLOT_MAX, max(local_top_k*2, 12)))
     fallback_pool = sorted((rows + scoped), key=lambda r: (-(len((r.get("content") or ""))), -(float(r.get("rrf") or 0.0))))
     top_items = _backfill_minimum(slot, prelim, stitched, fallback=fallback_pool)
     sources = []
@@ -652,6 +667,22 @@ def retrieve_slot(slot: str, spec: Dict[str, Any], top_k: int = 6, pool_n: int =
                 "merged_count": r.get("merged_count"),
             }
             for r in top_items
+        ],
+        "gen_items": [
+            {
+                "doc_id": r["document_id"],
+                "section_id": r["section_id"],
+                "title": r.get("title"),
+                "heading_number": r.get("heading_number"),
+                "seq": r.get("seq"),
+                "rrf": r.get("rrf"),
+                "content": r.get("content"),
+                "neighbors": r.get("neighbors") or [],
+                "definitions": r.get("definitions") or [],
+                "sources": r.get("sources") or [{"doc_id": r["document_id"], "section_id": r["section_id"], "title": r.get("title")}],
+                "merged_count": r.get("merged_count"),
+            }
+            for r in gen_items
         ],
         "sources": sources,
         "definitions": defs,
@@ -764,6 +795,7 @@ def build_scp(spec: Dict[str, Any], include_optional: bool = True, top_k: int = 
         "definitions_table": def_table,
         "primary_doc": primary,
         "secondary_docs": secondaries,
+        "doc_lock_ids": [d for d in [primary] + list(secondaries) if d],
         "slot_decisions": slot_decisions,
         "doc_ranking": doc_ranking,
         "retrieval_params": retrieval_params,
@@ -915,11 +947,22 @@ def main():
             for fut in as_completed(futs):
                 name = futs[fut]
                 results[name] = fut.result()
+        # build normalized definitions table
+        def_table = _normalize_def_table([d for s in results.values() for d in (s.get("definitions", []))])
+        # compute primary/secondaries for doc lock
+        primary, secondaries, slot_decisions = _compute_primary_and_secondaries(spec, results)
+        doc_ranking = _build_doc_ranking(spec, results, primary, secondaries)
+        doc_lock_ids = [d for d in [primary] + list(secondaries) if d]
         scp = {
             "spec": spec,
             "created_at": int(time.time()),
             "slots": results,
-            "definitions_table": [d for s in results.values() for d in (s.get("definitions", []))],
+            "definitions_table": def_table,
+            "primary_doc": primary,
+            "secondary_docs": secondaries,
+            "doc_lock_ids": doc_lock_ids,
+            "slot_decisions": slot_decisions,
+            "doc_ranking": doc_ranking,
             "notes": {
                 "neighbor_window": 1,
                 "max_defs": 6,

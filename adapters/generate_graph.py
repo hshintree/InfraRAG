@@ -65,9 +65,37 @@ try:
 except Exception:
     RUBRIC_CFG = {}
 
+# Per-section target length buckets (chars)
+CORE_SLOTS = {
+    "Definitions","Purchase and Sale","Price","Indemnities","Dispute Resolution","Limitations",
+}
+SECONDARY_SLOTS = {
+    "CPs","R&W - Seller","R&W - Buyer","Covenants","Notices","Termination","Governing Law","Closing","Adjustments","Miscellaneous"
+}
+OPTIONAL_SLOTS = {
+    "Change of Control","Performance Guarantee","Tax Matters","Environmental","Insurance"
+}
+
+def _target_chars_for_slot(slot: str) -> int:
+    # Allow explicit override
+    ov = os.getenv("GEN_TARGET_CHARS")
+    if ov and ov.isdigit():
+        return int(ov)
+    # Bucketed defaults; allow broader env overrides per bucket
+    core_default = int(os.getenv("GEN_TARGET_CHARS_CORE", "5000"))
+    sec_default = int(os.getenv("GEN_TARGET_CHARS_SECONDARY", "3000"))
+    opt_default = int(os.getenv("GEN_TARGET_CHARS_OPTIONAL", "2000"))
+    if slot in CORE_SLOTS:
+        return core_default
+    if slot in SECONDARY_SLOTS:
+        return sec_default
+    if slot in OPTIONAL_SLOTS:
+        return opt_default
+    return int(os.getenv("GEN_TARGET_CHARS_FALLBACK", "2500"))
+
 # ---------- Rubric config (lightweight, heuristic) ----------
 MANDATORY_CUES: Dict[str, List[str]] = RUBRIC_CFG.get("mandatory_cues") or {
-    "Parties": ["by and between", "Parties"],
+    "Parties": ["REGEX:this\s+agreement\s+is\s+made\s+by\s+and\s+(?:between|among)"],
     "Definitions": ["means"],
     "Purchase and Sale": ["sell", "purchase"],
     "Price": ["price"],
@@ -79,7 +107,7 @@ MANDATORY_CUES: Dict[str, List[str]] = RUBRIC_CFG.get("mandatory_cues") or {
     "Covenants": ["shall"],
     "Indemnities": ["indemnify", "hold harmless"],
     "Limitations": ["limitation of liability", "consequential"],
-    "Governing Law": ["governed by the laws"],
+    "Governing Law": ["REGEX:governed\s+.*\slaws"],
     "Dispute Resolution": ["arbitration"],
     "Notices": ["notice"],
     "Termination": ["terminate"],
@@ -91,6 +119,37 @@ STOP = {
     "the","and","for","with","that","shall","hereby","herein","agreement","party","parties",
     "of","to","in","by","as","on","or","any","all","be","is","are","this","section",
 }
+
+# Banned terms (evidence-agnostic, domain-specific); can be overridden via GEN_BANNED_TERMS
+DEFAULT_BANNED = [
+    "lng","tanker","driftwood","laytime","vetting","jkm","qatar","shipping",
+]
+
+def _banned_terms_for_spec(spec: Dict[str, Any]) -> List[str]:
+    env = os.getenv("GEN_BANNED_TERMS")
+    if env:
+        return [t.strip().lower() for t in env.split(",") if t.strip()]
+    # Example: for power industry, ban common LNG/maritime tokens
+    if (spec.get("industry") or "").lower() == "power":
+        return DEFAULT_BANNED
+    return []
+
+# Optional checklists per slot for Power/CO (extendable)
+CHECKLISTS_POWER_CO: Dict[str, List[str]] = {
+    "Price": ["demand charge","energy charge","market index (hub/LMP)","caps/floors","true-up","change-in-law"],
+    "Covenants": ["scheduling","curtailment","outages","balancing","telemetry","transmission and losses"],
+    "Indemnities": ["security","ratings triggers","cure periods"],
+    "Miscellaneous": ["PUC approvals","FERC/WECC coordination"],
+    "Environmental": ["RECs/green attributes ownership or N/A statement"],
+    "Governing Law": ["Colorado law","venue","severability","waiver","assignment limits"],
+}
+
+def _checklist_for_spec(slot: str, spec: Dict[str, Any]) -> List[str]:
+    ind = (spec.get("industry") or "").lower()
+    jur = (spec.get("jurisdiction") or "").lower()
+    if ind == "power" and jur in {"us-co","co","colorado"}:
+        return CHECKLISTS_POWER_CO.get(slot, [])
+    return []
 
 # ---------- Graph state ----------
 @dataclass
@@ -111,16 +170,43 @@ class GenState:
     retry_count: int = 0
     min_score: int = 75
     style: Dict[str, str] = field(default_factory=dict)
+    target_chars: int = 2500
+    banned_terms: List[str] = field(default_factory=list)
+    checklist: List[str] = field(default_factory=list)
+    parties: Dict[str, Any] = field(default_factory=dict)
 
 # ---------- Utilities ----------
 
 def _collect_evidence(scp: Dict[str,Any], slot: str) -> Tuple[List[str], List[str]]:
     slot_pkg = scp.get("slots", {}).get(slot, {})
-    items = slot_pkg.get("items", [])
+    # Prefer richer pool for drafting
+    items = slot_pkg.get("gen_items") or slot_pkg.get("items", [])
+
+    # 1) Prefer per-slot winning doc
+    chosen_doc = (scp.get("slot_decisions", {}).get(slot) or {}).get("doc")
+    if chosen_doc:
+        filtered = [r for r in items if (r.get("doc_id") or r.get("document_id")) == chosen_doc]
+        if filtered:
+            items = filtered
+
+    # 2) Then respect global doc lock (primary + secondaries)
     lock = set(scp.get("doc_lock_ids") or [])
     if lock:
         locked = [r for r in items if (r.get("doc_id") or r.get("document_id")) in lock]
-        items = locked or items
+        if locked:
+            items = locked
+
+    # Slot-aware gating at generation time (defensive against retrieval noise)
+    def _slot_ok(s: str) -> bool:
+        s_low = (s or "").lower()
+        if slot == "CPs": return ("condition precedent" in s_low) or ("conditions to closing" in s_low)
+        if slot == "Governing Law": return ("governed" in s_low and "law" in s_low)
+        if slot == "Dispute Resolution": return ("arbitra" in s_low) or ("dispute resolution" in s_low)
+        if slot == "Parties":
+            return (bool(re.search(r"\bthis agreement\s+is\s+made\s+by\s+and\s+(between|among)\b", s_low)) and "third part" not in s_low)
+        return True
+    items = [r for r in items if _slot_ok(r.get("title","") + "\n" + (r.get("content") or ""))] or items
+
     texts = [(r.get("title") or "") + "\n" + (r.get("content") or "") for r in items]
     defs_table = scp.get("definitions_table") or []
     terms = []
@@ -156,18 +242,19 @@ DRAFT_PROMPT = ChatPromptTemplate.from_messages([
      "* Use only concepts that are reasonably supported by the evidence; avoid domain drift.\n"
      "* Prefer compact, single-heading output: Title on first line, then body.\n"
      "* Match the source style: caps_headings={caps_headings}, numbering={numbering}.\n"
-     "* No placeholders like [TBD] or 'as defined in Section X' unless present in evidence.\n"
+     "* Produce at least {target_chars} characters for this section; if below target, keep expanding without repetition.\n"
+     "* Do not mention these terms unless present in the evidence: {banned_terms}.\n"
      "* Keep defined terms consistent and capitalized.\n"
      "* No duplicated words (e.g., 'Purchase Purchase').\n"
      ),
     ("human",
-     "Slot: {slot}\nConstraints: {constraints}\nAllowed terms (soft): {allowed_terms}\nEvidence (snippets):\n---\n{evidence}\n---\nPlease draft the clause. Start with a single Title line, then the clause body. Do not include citations or footnotes.")
+     "Slot: {slot}\nConstraints: {constraints}\nParties (if detected): {parties}\nChecklist (cover these where applicable): {checklist}\nAllowed terms (soft): {allowed_terms}\nEvidence (snippets):\n---\n{evidence}\n---\nDraft the full section with numbered subsections and sufficient detail.")
 ])
 
 REV_PROMPT = ChatPromptTemplate.from_messages([
-    ("system","Revise the clause to address reviewer issues while staying faithful to the evidence."),
+    ("system","Revise and expand to meet the target length while staying faithful to the evidence and constraints."),
     ("human",
-     "Slot: {slot}\nConstraints: {constraints}\nReviewer issues:\n{issues}\nEvidence (snippets):\n---\n{evidence}\n---\nReturn the corrected clause with a single Title line and body. Avoid placeholders and domain drift.")
+     "Slot: {slot}\nConstraints: {constraints}\nTarget length (chars): {target_chars}\nReviewer issues:\n{issues}\nChecklist: {checklist}\nDo not mention: {banned_terms}\nEvidence (snippets):\n---\n{evidence}\n---\nReturn the corrected clause with a single Title line and a fully expanded body.")
 ])
 
 # Optional DSPy teleprompted program
@@ -234,14 +321,20 @@ def _align_pct(text: str, evidence: List[str]) -> float:
             good += 1
     return good / max(1, len(sents))
 
-def rubric_score(slot: str, text: str, evidence: List[str], constraints: Dict[str,Any], industry: str | None) -> Dict[str, Any]:
+def rubric_score(slot: str, text: str, evidence: List[str], constraints: Dict[str,Any], industry: str | None, target_chars: int) -> Dict[str, Any]:
     scores: Dict[str, float] = {}
     notes: List[str] = []
     low = text.lower()
 
     cues = MANDATORY_CUES.get(slot, [])
-    hit = sum(1 for c in cues if c.lower() in low)
-    scores["slot_fit"] = 20.0 * (hit / max(1, len(cues)))
+    hit = 0
+    for c in cues:
+        if isinstance(c, str) and c.startswith("REGEX:"):
+            if re.search(c[6:], low):
+                hit += 1
+        elif isinstance(c, str) and c.lower() in low:
+            hit += 1
+    scores["slot_fit"] = 30.0 * (hit / max(1, len(cues)))
 
     vocab = _evidence_vocab(evidence)
     ev_set = set(vocab)
@@ -262,7 +355,7 @@ def rubric_score(slot: str, text: str, evidence: List[str], constraints: Dict[st
 
     cons = 0.0
     if slot == "Governing Law":
-        if "governed" in low and "laws" in low:
+        if re.search(r"governed\s+.*\slaws", low):
             cons += 10
         if constraints.get("law") and str(constraints["law"]).lower() in low:
             cons += 5
@@ -278,7 +371,6 @@ def rubric_score(slot: str, text: str, evidence: List[str], constraints: Dict[st
         cons += 12
     scores["constraints"] = min(15.0, cons)
 
-    # Dynamic drift: penalize tokens not in evidence vocab
     ev_vocab = set(_evidence_vocab(evidence, max_terms=120))
     draft_tokens = [w for w in re.findall(r"[a-z][a-z\-]{2,}", low) if w not in STOP]
     ood_hits = sum(1 for w in draft_tokens if (w not in ev_vocab))
@@ -286,14 +378,19 @@ def rubric_score(slot: str, text: str, evidence: List[str], constraints: Dict[st
     if ood_hits > 0:
         notes.append("Possible domain drift relative to evidence")
 
-    # Source alignment score (extractive overlap proxy)
     align = _align_pct(text, evidence)
     scores["source_alignment"] = round(20.0 * align, 1)
     if align < 0.5:
         notes.append("Many sentences weakly supported by evidence")
 
     n_chars = len(text.strip())
-    scores["length"] = 5.0 if 200 <= n_chars <= 4000 else 3.0
+    if n_chars >= target_chars:
+        length_score = 5.0
+    elif n_chars >= int(0.8 * target_chars):
+        length_score = 2.5
+    else:
+        length_score = 0.0
+    scores["length"] = length_score
 
     total = round(sum(scores.values()), 1)
 
@@ -316,13 +413,48 @@ def rubric_score(slot: str, text: str, evidence: List[str], constraints: Dict[st
 def node_prepare(state: GenState) -> GenState:
     ev, terms = _collect_evidence(state.scp, state.slot)
     state.evidence = ev
+    # Allow both definition terms and high-frequency evidence terms
     state.allowed_terms = list(dict.fromkeys(terms + _evidence_vocab(ev)))[:80]
-    state.constraints = (state.scp.get("spec", {}) or {}).get("constraints", {})
+    spec = state.scp.get("spec", {}) or {}
+    state.constraints = spec.get("constraints", {})
     state.style = _style_profile(ev)
+    state.target_chars = _target_chars_for_slot(state.slot)
+    state.banned_terms = _banned_terms_for_spec(spec)
+    state.checklist = _checklist_for_spec(state.slot, spec)
+    # Parties extraction context
+    joined = "\n".join(ev)
+    m = re.search(r"this agreement\s+is\s+made\s+by\s+and\s+(?:between|among)\s+(.+?)\s+and\s+(.+?)\.", joined, re.I|re.S)
+    if m:
+        state.parties = {"party_a": m.group(1).strip(), "party_b": m.group(2).strip()}
     return state
 
 _llm = ChatOpenAI(model=LLM_MODEL, temperature=TEMPERATURE)
 _dspy_drafter = _DSPyDraft() if USE_DSPY else None
+
+def _greedy_compose(evidence: List[str], target_chars: int = 1200) -> str:
+    import itertools
+    ev = "\n".join(evidence).lower()
+    picked: List[str] = []
+    used: set[str] = set()
+    sents = list(itertools.chain.from_iterable(
+        re.split(r"(?<=[.;:])\s+", t) for t in evidence))
+    for s in sents:
+        key = re.sub(r"\s+"," ", s.strip().lower())
+        if len(key) < 40 or key in used:
+            continue
+        # simple containment or 2-gram overlap proxy
+        toks = key.split()
+        bi = set(zip(toks, toks[1:])) if len(toks) > 1 else set()
+        ev_tokens = ev.split()
+        ev_bi = set(zip(ev_tokens, ev_tokens[1:])) if len(ev_tokens) > 1 else set()
+        inter = len(bi & ev_bi)
+        denom = max(1, len(bi))
+        if (key in ev) or ((inter / denom) >= 0.25):
+            picked.append(s.strip())
+            used.add(key)
+        if sum(len(x) for x in picked) > target_chars:
+            break
+    return "\n".join(picked)
 
 def node_draft(state: GenState) -> GenState:
     # Extract-then-compose for Definitions
@@ -333,25 +465,34 @@ def node_draft(state: GenState) -> GenState:
         seen: set[str] = set()
         for m in pat.finditer(joined):
             frag = m.group(0).strip()
-            key = frag.lower().rstrip('.')
+            key = re.sub(r"\s+", " ", frag.lower().rstrip('.'))
             if key not in seen:
                 uniq.append(frag.rstrip(".") + ".")
                 seen.add(key)
         if uniq:
-            body = "\n".join(uniq[:100])
+            body = "\n".join(uniq[:200])
             title = "Definitions"
             state.draft = SlotDraft(title=title, text=f"{title}\n\n{body}")
             return state
 
-    ev = "\n---\n".join(state.evidence[:3])
+    use_n = int(os.getenv("GEN_EVID_N", "25"))
+    ev = "\n---\n".join(state.evidence[:use_n])
+    extractive = _greedy_compose(state.evidence[:use_n], target_chars=state.target_chars)
+    if extractive and len(extractive) > max(400, int(0.2 * state.target_chars)):
+        priming = f"[BEGIN EXTRACTIVE BASIS]\n{extractive}\n[END EXTRACTIVE BASIS]"
+        ev = priming + "\n\n" + ev
     if _dspy_drafter:
         text = _dspy_drafter(state.slot, state.constraints, state.allowed_terms, ev)
     else:
         msgs = DRAFT_PROMPT.format_messages(
             slot=state.slot,
             constraints=json.dumps(state.constraints) if state.constraints else "{}",
-            allowed_terms=", ".join(state.allowed_terms[:40]),
+            parties=json.dumps(getattr(state, "parties", {})) if getattr(state, "parties", None) else "{}",
+            allowed_terms=", ".join(state.allowed_terms[:60]),
             evidence=ev,
+            target_chars=str(state.target_chars),
+            banned_terms=", ".join(state.banned_terms) if state.banned_terms else "(none)",
+            checklist=", ".join(state.checklist) if state.checklist else "(none)",
             **(state.style or {}),
         )
         text = _llm.invoke(msgs).content
@@ -373,7 +514,7 @@ def node_validate(state: GenState) -> GenState:
 
 def node_score(state: GenState) -> GenState:
     industry = (state.scp.get("spec", {}) or {}).get("industry")
-    sc = rubric_score(state.slot, state.draft.text, state.evidence, state.constraints, industry)
+    sc = rubric_score(state.slot, state.draft.text, state.evidence, state.constraints, industry, state.target_chars)
     state.draft.scorecard = sc
     return state
 
@@ -381,18 +522,37 @@ def should_retry(state: GenState) -> str:
     sc = state.draft.scorecard or {}
     hard = any(state.draft.issues)
     low_total = sc.get("total", 0) < state.min_score
-    weak_ground = (sc.get("subscores", {}).get("source_alignment", 0) < 10.0)
-    drift = (sc.get("subscores", {}).get("domain_drift", 10) < 6.0)
-    low = low_total or weak_ground or drift
+    weak_ground = (sc.get("subscores", {}).get("source_alignment", 0) < 14.0)
+    slot_bad = (sc.get("subscores", {}).get("slot_fit", 0) < 15.0)
+    drift = (sc.get("subscores", {}).get("domain_drift", 10) < 7.0)
+    # Length gate: require >= 80% of target
+    meets_len = len((state.draft.text or "").strip()) >= int(0.8 * state.target_chars)
+    low = low_total or weak_ground or slot_bad or drift or (not meets_len)
     return "revise" if (state.retry_count == 0 and (hard or low)) else "ok"
 
 
 def node_revise(state: GenState) -> GenState:
-    ev = "\n---\n".join(state.evidence[:3])
+    # Rebuild a small, slot-gated evidence pack for revision
+    gated: List[str] = []
+    for t in state.evidence:
+        tl = t.lower()
+        if state.slot == "CPs" and ("condition precedent" in tl or "conditions to closing" in tl):
+            gated.append(t)
+        elif state.slot == "Parties" and re.search(r"\bthis agreement\s+is\s+made\s+by\s+and\s+(between|among)\b", tl):
+            gated.append(t)
+        elif state.slot == "Governing Law" and re.search(r"governed.*laws", tl):
+            gated.append(t)
+        elif state.slot == "Dispute Resolution" and ("arbitra" in tl or "dispute resolution" in tl):
+            gated.append(t)
+    use_n = int(os.getenv("GEN_EVID_N", "25"))
+    ev = "\n---\n".join((gated or state.evidence)[:use_n])
     msgs = REV_PROMPT.format_messages(
         slot=state.slot,
         constraints=json.dumps(state.constraints) if state.constraints else "{}",
+        target_chars=str(state.target_chars),
         issues="\n- " + "\n- ".join(state.draft.issues + (state.draft.scorecard.get("notes") or [])),
+        checklist=", ".join(state.checklist) if state.checklist else "(none)",
+        banned_terms=", ".join(state.banned_terms) if state.banned_terms else "(none)",
         evidence=ev,
     )
     text = _llm.invoke(msgs).content
@@ -432,13 +592,13 @@ def run_for_slot(scp: Dict[str,Any], slot: str, min_score: int) -> Dict[str,Any]
         if isinstance(obj, dict):
             return obj.get(name, default)
         return getattr(obj, name, default)
-    out = app.invoke(init)
-    draft_obj = _get(out, "draft")
+    out_state = app.invoke(init)
+    draft_obj = _get(out_state, "draft")
     title = _get(draft_obj, "title", slot) if draft_obj else slot
     text = _get(draft_obj, "text", "") if draft_obj else ""
     issues = _get(draft_obj, "issues", []) if draft_obj else []
     scorecard = _get(draft_obj, "scorecard", {}) if draft_obj else {}
-    retries = _get(out, "retry_count", 0)
+    retries = _get(out_state, "retry_count", 0)
     return {
         "title": title,
         "text": text,
