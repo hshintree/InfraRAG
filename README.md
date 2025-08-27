@@ -10,6 +10,17 @@ InfraRAG is a retrieval-augmented drafting system for commercial agreements. It 
 - Generation: LangGraph state machine produces per-slot sections from an SCP artifact; extractive-first for Definitions and Parties; evidence-locked drafting with per-section length targets; rubric scoring and one revise pass when required.
 - Provenance and QC: SCP package captures items, sources, definitions, queries, and filters; generation produces scorecards per slot.
 
+### System Design Diagram
+
+- Mermaid source: `docs/system_overview.mmd`
+- Export with Mermaid CLI:
+
+```bash
+npm i -g @mermaid-js/mermaid-cli
+mmdc -i docs/system_overview.mmd -o docs/system_overview.png
+mmdc -i docs/system_overview.mmd -o docs/system_overview.svg
+```
+
 ## Repository structure
 
 - `src/` parsers, ingestion, and schema

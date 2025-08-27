@@ -1,0 +1,96 @@
+flowchart LR
+  classDef store fill:#eef,stroke:#88a,stroke-width:1px;
+  classDef svc fill:#efe,stroke:#6a6,stroke-width:1px;
+  classDef stage fill:#f7f7f7,stroke:#999,stroke-width:1px;
+  classDef io fill:#fff,stroke:#666,stroke-dasharray:3 3;
+
+  subgraph S["Data Sources"]
+    A1["Contracts (PDF/XML)"]:::io
+  end
+
+  subgraph I["Ingestion & Parsing"]
+    I1["Parsers (PDF/XML)"]:::stage
+    I2["Normalize & Chunk\n(headings, clause-type, defined terms)"]:::stage
+  end
+
+  subgraph X["Indexing"]
+    X1["PostgreSQL + pgvector"]:::store
+    X2["FTS / Trigram Indexes"]:::store
+  end
+
+  subgraph O["Orchestration (LangDSPy)"]
+    O1["MultiQuery (paraphrases)"]:::svc
+    O2["HyDE → terms"]:::svc
+    O3["SelfQuery → filters/tokens"]:::svc
+    O4["Guardrails & heading_like\n(law/seat gating)"]:::svc
+  end
+
+  subgraph R["Retrieval"]
+    R1["Hybrid Search\n(Vector + FTS with RRF)"]:::stage
+    R2["Token/Regex Gates"]:::stage
+    R3["CrossEncoder Reranker"]:::svc
+    R4["Doc Locks & Slot Decisions"]:::stage
+  end
+
+  subgraph B["SCP Builder"]
+    B1["Rank & Filter per Slot\n(strict Parties/Defs)"]:::stage
+    B2["gen_items (10–12) for generation"]:::stage
+    B3["doc_lock_ids (primary+secondaries)"]:::stage
+    B4["SCP JSON"]:::io
+  end
+
+  subgraph G["Generation (LangGraph)"]
+    G1["Prepare → Draft → Score → Revise"]:::stage
+    G2["Extractive-first\n(Definitions, Parties)"]:::stage
+    G3["Style Profile (caps/numbering)"]:::stage
+    G4["Length Targets per Section\n+ Banned Terms + Checklists"]:::stage
+    G5["Rubric (slot-fit, overlap, alignment, length)"]:::stage
+    G6["Drafts + Scorecards"]:::io
+    G7["Assembled Contract"]:::io
+  end
+
+  subgraph Q["QC & Learning"]
+    Q1["scp_quality (reports)"]:::svc
+    Q2["DSPy Offline Optimizer (future)"]:::svc
+  end
+
+  subgraph C["Config / Infra"]
+    C1[".env (DB, LLM, HF, weights)"]:::io
+    C2["Hugging Face (CrossEncoder)"]:::svc
+    C3["Modal Embeddings (optional)"]:::svc
+  end
+
+  A1 --> I1 --> I2 --> X1
+  I2 --> X2
+  X1 --> R1
+  X2 --> R1
+
+  O1 --> R1
+  O2 --> O1
+  O3 --> O1
+  O4 --> O3
+
+  R2 --> R1
+  R4 --> R1
+  R1 --> R3
+
+  R3 --> B1
+  B1 --> B2 --> B4
+  B1 --> B3 --> B4
+
+  B4 --> G1
+  G1 --> G2
+  G1 --> G3
+  G1 --> G4
+  G1 --> G5
+  G5 --> G6 --> G7
+
+  B4 -.-> Q1
+  G6 -.-> Q1
+  Q1 -.-> Q2
+
+  C1 --> O1
+  C1 --> R1
+  C1 --> G1
+  C2 --> R3
+  C3 --> R1 
